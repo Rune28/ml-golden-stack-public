@@ -1,6 +1,0 @@
-apiVersion: v2
-name: de-worker
-description: Temporal worker of the pipeline (task queue `de`) and the RBAC to run its Kubernetes Jobs
-type: application
-version: 0.1.0
-appVersion: "0.1.0"

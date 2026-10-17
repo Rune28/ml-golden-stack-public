@@ -9,13 +9,13 @@ Reference stack for multi-model batch ML pipelines: OpenTofu, Kubernetes, Kueue 
 The decisions the stack is built on, in the order they were made. Each rule says why it exists and where it is in the code; what is not built yet links to the backlog.
 
 1. **Temporal orchestrates services across teams; it carries IDs, not data.** A workflow is the agreed process, each team implements its activities on its own task queue, and the contract is the names of workflows and activities and their payloads. Orchestration rather than choreography on purpose: a multi-step process that ends in a promotion decision has to be visible in one history. Data moves through ClickHouse and the object store.
-   *Here:* be_service (Rust) starts workflows, de_worker (Python) runs them, payloads in `de_worker/src/workflow/contracts.py`. *Not yet:* a second team's task queue, one schema for Rust and Python ([Contracts](BACKLOG.md#contracts-between-be_service-and-de_worker)).
+   *Here:* be_service (Rust) starts workflows; batch_worker (queue `batch`) and llm_worker (queue `llm`), both Python, run them; payloads in the `src/workflow/contracts.py` of each worker. *Not yet:* one schema for Rust and Python ([Contracts](BACKLOG.md#contracts-between-be_service-and-the-workers)).
 
 2. **Models are libraries behind a fixed API; the platform owns all I/O.** Data scientists build a model library against an agreed public API and test it on mock data; the platform wraps it into a Job. Both sides work in parallel, and the platform is tested end to end before a real model exists. A model is onboarded in four steps: run the notebook, keep its output as a golden test, move the code into the library, run it as a Job. It is accepted when the Job reproduces the notebook within an agreed tolerance.
    *Here:* `mle_models/src/mnist` (no I/O), `mle_models/src/jobs` (ClickHouse, MLflow, S3). *Not yet:* a model interface that lets `jobs` run any library by name, an image per model, conformance tests on mock data.
 
-3. **The unit of execution is a disposable Kubernetes Job.** A step that gets all its inputs as arguments and leaves its result in the object store runs on any spot or GPU node of any cluster that meets the [cluster contract](#cluster-contract).
-   *Here:* `de_worker/src/workflow/activities/run_job.py`. *Not yet:* evictions not counted as failures, checkpoints ([Disruption tolerance](BACKLOG.md#disruption-tolerance)).
+3. **Batch is the work of a model over a dataset, and it runs as a disposable Kubernetes Job.** Training a model, predicting or reporting over a dataset, indexing the whole corpus again for a new embedding model: such a step gets all its inputs as arguments, leaves its result in the object store and runs on any spot or GPU node of any cluster that meets the [cluster contract](#cluster-contract). The Job holds the heavy dependencies (torch) and the memory of the dataset, so the worker holds neither. A single event is never batch (rule 12).
+   *Here:* `batch_worker/src/workflow/activities/run_job.py`, `mle_models/src/jobs`. *Not yet:* evictions not counted as failures, checkpoints ([Disruption tolerance](BACKLOG.md#disruption-tolerance)).
 
 4. **Capacity is managed by the queue, not by services.** Kueue decides which Job runs where and when; a new cluster is an OpenTofu module plus a Kueue registration (MultiKueue across clusters).
    *Not yet:* planned, [Kueue](BACKLOG.md#kueue-queueing-pipeline-jobs).
@@ -27,10 +27,10 @@ The decisions the stack is built on, in the order they were made. Each rule says
    *Here:* `run_job` (Job name from step and `run_id`), `write_predictions`, `be_service/src/ingest.rs`, with tests. *Not yet:* [idempotency gaps](BACKLOG.md#idempotency-of-pipeline-steps).
 
 7. **Critical functions have an owner who can explain every line.** Anything that writes or deletes shared data or moves a pointer (ingest, writing predictions, promotion) is written or reviewed line by line by the platform team and tested against retries and partial failures. Moving blocks of the pipeline later is safe only when these are understood.
-   *Here:* idempotency tests in `mle_models/tests`, `de_worker/tests`, `be_service/src/ingest.rs`. *Not yet:* CODEOWNERS, compare-and-set promotion ([Promotion safety](BACKLOG.md#promotion-safety)).
+   *Here:* idempotency tests in `mle_models/tests`, `batch_worker/tests`, `llm_worker/tests`, `be_service/src/ingest.rs`. *Not yet:* CODEOWNERS, compare-and-set promotion ([Promotion safety](BACKLOG.md#promotion-safety)).
 
 8. **Promotion policy lives in the workflow.** The train step reports metrics, the workflow decides: the policy changes without rebuilding the image, and every decision is in the workflow history. The same champion/challenger can later choose between versions of data, not only of models.
-   *Here:* `de_worker/src/workflow/train.py`, MLflow alias `champion`. *Not yet:* a fixed evaluation set as an explicit contract, data-level promotion.
+   *Here:* `batch_worker/src/workflow/train.py`, MLflow alias `champion`. *Not yet:* a fixed evaluation set as an explicit contract, data-level promotion.
 
 9. **Two layers guard data quality.** CI runs the test cases that accumulate with every incident against every code change. In the pipeline, a validation gate before train and promote stops the workflow when the data breaks an invariant. CI catches regressions in code; the gate catches bad data that arrives while the code stays the same.
    *Here:* unit tests of all three services in CI. *Not yet:* the gate, an end-to-end run on kind in CI, a model quality threshold.
@@ -38,20 +38,27 @@ The decisions the stack is built on, in the order they were made. Each rule says
 10. **Schema changes go expand, then contract.** Migrations run before the applications (`depends_on`), so a change must work with the previous release, including Jobs still running the previous image. Adding: migration first. Removing or renaming: code first, migration in a later release. An applied migration is never edited.
     *Example:* `digit_report.report_run_id` was named against rule 5. Migration 0005 (expand) adds `run_id` with `DEFAULT report_run_id`, so the previous image, which writes only `report_run_id`, keeps working and old rows read the right value; the current image writes both. The contract step comes in a later release: `MATERIALIZE COLUMN run_id`, `MODIFY COLUMN run_id REMOVE DEFAULT`, `DROP COLUMN report_run_id`, in this order, since ClickHouse refuses to drop a column another column's default depends on.
 
-11. **A run exists for readers once it is committed to the run registry, and readers read only views.** A step writes its rows first and a marker in `ml_data.runs` last. Views join the data with the registry, so a run halfway through is never seen, and "the latest" run per parent is chosen by its logical start (when the workflow scheduled the step, the same on every retry), never by the time of an insert. The marker is written by the platform layer of the Job, not by model code, and the workflows do not change. `run_id` is unique across the platform and is the whole key of the registry, so a repeated commit merges away. Readers depend on views, writers on tables: a table can change its key or layout without any reader noticing. This is a small version of the snapshot commits of table formats such as Iceberg and Delta, and the way to them if the platform outgrows plain ClickHouse tables.
-    *Here:* migrations 0006–0009, `commit_run` in `mle_models/src/jobs/clickhouse.py`, `--started-at` from `run_job`; be_service reads `digit_report_latest`. *Not yet:* markers for batches, train reading committed batches only, views for the other reads of be_service, cleanup of uncommitted rows ([Run registry](BACKLOG.md#run-registry)).
+11. **A run exists for readers once it is committed to the run registry, and readers read only views.** A step writes its rows first and a marker in `ml_data.runs` last. Views join the data with the registry, so a run halfway through is never seen, and "the latest" run per parent is chosen by its logical start (when the workflow scheduled the step, the same on every retry), never by the time of an insert. The marker is written by the platform layer of whoever wrote the rows: the Job for batch work, the activity in the worker for stream work; never by model code, and the workflows do not change. `run_id` is unique across the platform and is the whole key of the registry, so a repeated commit merges away. Readers depend on views, writers on tables: a table can change its key or layout without any reader noticing. This is a small version of the snapshot commits of table formats such as Iceberg and Delta, and the way to them if the platform outgrows plain ClickHouse tables.
+    *Here:* migrations 0006–0009, `commit_run` in `mle_models/src/jobs/clickhouse.py` (batch, `--started-at` from `run_job`) and in `llm_worker/src/workflow/activities/index.py` (stream, the activity's scheduled time); be_service reads `digit_report_latest`. *Not yet:* markers for batches, train reading committed batches only, views for the other reads of be_service, cleanup of uncommitted rows ([Run registry](BACKLOG.md#run-registry)).
+
+12. **Events are a stream: processed in the worker as they come, against a model server.** An uploaded file and a chat message are each one small piece of work, done in seconds: starting a pod and loading a model for each would take longer than the work. They run as activities of the worker that call a long-running model server, a batch of chunks at a time, with a heartbeat after each, so the worker never holds more than one batch of vectors. The same operation over the whole dataset is batch again (rule 3): one uploaded file is indexed in the worker, the whole corpus for a new model in a Job. The model server is reached through one name in the cluster, `llm.llm.svc`, and one adapter with an OpenAI-compatible API, so the server (Ollama on the host, vLLM in the cluster, a managed endpoint) changes without changing the callers.
+    *Here:* `infra/modules/llm-local`, `llm_worker/src/workflow/llm.py`, `index_file` in `llm_worker/src/workflow/activities/index.py`, `make llm-check`. *Next:* the chat answer ([docs/llm-plan.md](docs/llm-plan.md)); *not yet:* the corpus re-index as a Job.
+
+13. **There are two release mechanics: one `tofu apply` for the MVP, GitOps for applications once the team outgrows it.** Today one apply of `envs/<name>` releases the infrastructure and the applications (`helm_release`) together: one dependency graph (migrations before applications), infrastructure outputs passed straight to the applications. A changed setting is an apply too, but only the resources whose values changed are updated, and a checksum of the settings on the pod rolls it. This fits one environment and a small team. The split comes when application releases queue behind the state lock, a second environment appears, or CI must not hold the whole state just to bump an image tag: OpenTofu keeps the infrastructure and installs Argo CD, Argo CD deploys the applications from the repo. To keep that move about a week of work, applications get the values the infrastructure owns (hosts, buckets, passwords) only through named ConfigMaps and Secrets, which stay the contract between the two layers, and nothing else of OpenTofu's goes into `helm_release` values.
+    *Here:* ConfigMaps and Secrets `pipeline-job` in `infra/modules/batch-worker` and `llm-worker` in `infra/modules/llm-worker`, `checksum/settings` in those modules and in `infra/modules/be-service`. *Not yet:* Argo CD; model names, which the application owns, are still OpenTofu variables written into the `llm-worker` ConfigMap ([Drift detection](BACKLOG.md#drift-detection)).
 
 ## Layout
 
 | Directory | Purpose |
 |---|---|
 | `infra/clusters/kind` | local kind cluster |
-| `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `de-worker`, `be-service` |
-| `infra/charts` | Helm charts of our own applications: `de-worker`, `be-service` |
+| `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `llm-local`, `batch-worker`, `llm-worker`, `be-service` |
+| `infra/charts` | Helm charts of our own applications: `batch-worker`, `llm-worker`, `be-service` |
 | `infra/envs/local` | local environment: wires the modules onto the kind cluster |
 | `db/clickhouse/migrations` | ClickHouse schema (golang-migrate, one statement per file) |
-| `be_service` | Rust: the page and its API. Adds data to ClickHouse, starts workflows in Temporal |
-| `de_worker` | Python: Temporal worker. Workflows `Train`, `Run` and `Report`, activity `run_job` that runs a Kubernetes Job |
+| `be_service` | Rust: the platform API and the MNIST page. Adds data to ClickHouse, stores uploaded files, starts workflows in Temporal (its only client) |
+| `batch_worker` | Python: Temporal worker of the queue `batch`. Workflows `Train`, `Run`, `Report`, activity `run_job` that runs each step as a Kubernetes Job |
+| `llm_worker` | Python: Temporal worker of the queue `llm`. Workflow `Index`, activity `index_file` that indexes an uploaded file in the worker; `rag` (chunking, no I/O); the LLM adapter |
 | `mle_models` | Python: `mnist` (model code, no I/O) and `jobs` (the Job entry points: train, predict, report, promote) |
 | `scripts/images.sh` | builds the application images and loads them into kind |
 
@@ -69,7 +76,7 @@ flowchart TB
         subgraph cpu["cpu pool · 3 nodes"]
             direction TB
             be["be-service<br/>page + API · :9001"]
-            dw["de-worker<br/>Temporal worker, queue de"]
+            dw["batch-worker<br/>Temporal worker, queue batch"]
             subgraph temporal["temporal"]
                 fe["frontend :7233"]
                 tsrv["history · matching · worker"]
@@ -92,7 +99,7 @@ flowchart TB
     be -- "start Train / Run" --> fe
     fe --- tsrv
     tsrv --> pg
-    dw -- "poll queue de" --> fe
+    dw -- "poll queue batch" --> fe
     dw -- "run_job: create Job, wait" --> jobt
     dw --> jobp
     jobt -- "read samples" --> ch
@@ -123,7 +130,7 @@ flowchart LR
         data["postgres-local · seaweedfs-local · clickhouse-local"]
         schema["postgres-database (mlflow) · clickhouse-migrate (Job)"]
         svc["temporal (official chart) · mlflow"]
-        apps["de-worker · be-service<br/>own charts in infra/charts"]
+        apps["batch-worker · llm-worker · be-service<br/>own charts in infra/charts"]
     end
 
     kindc --> gpun
@@ -244,7 +251,7 @@ Adding data and training again shows the point of the demo: accuracy grows with 
 | Step | Who | Where the result goes |
 |---|---|---|
 | Add data | be_service, directly | `ml_data.samples`, one `batch_id` (UUID v7) per batch |
-| Train | Temporal `Train` → de_worker `run_job` → Job `train` | MLflow run + new version of `mnist-cnn`, `result.json` |
+| Train | Temporal `Train` → batch_worker `run_job` → Job `train` | MLflow run + new version of `mnist-cnn`, `result.json` |
 | Promote | decided in the workflow, Job `promote` | MLflow alias `champion` |
 | Run | Temporal `Run` → Job `predict` | `ml_data.predictions` under the run's `run_id` |
 | Report | Temporal `Report` → Job `report` on the latest prediction run | `ml_data.digit_report`: per digit, how many the model recognized and how many there are; every report is kept, the page reads the latest per prediction run through the view `digit_report_latest` |
@@ -255,6 +262,22 @@ Contracts that hold the pieces together:
 - Workflow IDs are fixed (`train`, `run`, `report`): a second press while one runs is refused by Temporal.
 - `run_job` names the Job `<step>-<run_id>`: a retried activity finds the Job it created instead of starting the step again. Every step is idempotent: a partial batch or prediction run is rewritten, a complete one skipped.
 - The `mnist` package has no I/O; `jobs` does ClickHouse, MLflow and S3 around it.
+
+## Retrieval
+
+Files uploaded through the platform API become chunks with embeddings in ClickHouse; the chat (the next slice of [docs/llm-plan.md](docs/llm-plan.md)) answers from them.
+
+```bash
+make upload FILE=README.md   # stored in the object store, a row in ml_data.files, workflow Index
+make files                   # every file with its index state: indexing, indexed (chunks, model), failed
+```
+
+| Step | Who | Where the result goes |
+|---|---|---|
+| Upload | be_service: checks (text, up to 10 MiB, UTF-8), sha256 as `file_id`, object store, then `files` | `pipeline/files/<file_id>`, `ml_data.files` |
+| Index | Temporal `Index` → activity `index_file` in the worker (no Job, rule 12): chunks of about 1,000 characters, embedded 32 at a time by the LLM server | `ml_data.doc_chunks` under the run's `run_id`, marker `kind='index'`; readers use `doc_chunks_current` |
+
+The same bytes uploaded again return the file already there. A file is indexed again with `POST /api/files/<file_id>/index`: after a failure, or with a new embedding model, whose vectors live next to the old ones until the new index is committed.
 
 ## Platform services
 
@@ -275,12 +298,45 @@ kubectl -n clickhouse get secret clickhouse -o jsonpath='{.data.password}' | bas
 kubectl -n seaweedfs port-forward svc/seaweedfs 8888:8888       # filer UI: http://127.0.0.1:8888
 ```
 
+### LLM server
+
+The model server runs on the host, not in kind: the GPU is not passed into the cluster yet, and weights in the host's VRAM cost the cluster no memory. The cluster reaches it as `http://llm.llm.svc` (`modules/llm-local`: a Service without a selector and an EndpointSlice pointing to the host).
+
+Ollama, installed once without sudo, listening only on the kind bridge so the rest of the network cannot use it:
+
+```bash
+curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | tar x --zstd -C ~/.local
+mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/ollama.service <<'UNIT'
+[Unit]
+Description=Ollama, listening only on the kind bridge
+
+[Service]
+Environment=OLLAMA_HOST=172.18.0.1:11434
+ExecStart=%h/.local/bin/ollama serve
+# The kind bridge appears only after docker creates it: retry until it does.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload && systemctl --user enable --now ollama
+
+export OLLAMA_HOST=172.18.0.1:11434
+ollama pull qwen3:4b   # chat, ~2.5 GB of VRAM
+ollama pull bge-m3     # embeddings, multilingual, 1024 dimensions, ~1.2 GB
+make llm-check         # one answer and one embedding from inside the cluster
+```
+
+The models are variables of `envs/local` (`llm_chat_model`, `llm_embed_model`): another chat model is `ollama pull` and a new name. Another embedding model also needs every file indexed again, since vectors of different models cannot be compared.
+
 ### Applications
 
 | Application | Chart | Runs |
 |---|---|---|
 | be-service | `infra/charts/be-service` | one replica (Add data is serialized in-process), NodePort 30901 |
-| de-worker | `infra/charts/de-worker` | Role to create, watch and delete Jobs and read pod logs in `de-worker` only |
+| batch-worker | `infra/charts/batch-worker` | Role to create, watch and delete Jobs and read pod logs in `batch-worker` only |
+| llm-worker | `infra/charts/llm-worker` | none: no Role, no service account token in the pod |
 | pipeline Jobs | created by `run_job` | `train` on the `gpu` pool (toleration + `nvidia.com/gpu: 1`), `predict` and `promote` on `cpu`; `ttlSecondsAfterFinished: 3600` |
 
 ### Temporal

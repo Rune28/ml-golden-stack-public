@@ -1,7 +1,7 @@
 """ClickHouse access of the jobs. Tables come from db/clickhouse/migrations.
 
 samples are written by be_service (Add data); the jobs only read them and
-write predictions."""
+write predictions and reports."""
 
 import os
 from datetime import datetime
@@ -123,7 +123,9 @@ def write_digit_report(client, prediction_run_id: str, run_id: str, model_versio
 def commit_run(client, kind: str, run_id: str, started_at: datetime, rows: int, parents: dict[str, str]) -> None:
     """The last action of a step that wrote rows: they are complete. Readers
     see a run only through views over the `runs` registry. A repeated commit
-    (the Job retried after this point) is a duplicate that merges away."""
+    (the Job retried after this point) is a duplicate that merges away.
+    A copy in llm_worker/src/workflow/activities/index.py commits stream
+    runs: keep the two writing the same marker."""
     client.insert(
         "runs",
         [[run_id, kind, parents, started_at, rows]],

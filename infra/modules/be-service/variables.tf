@@ -43,3 +43,17 @@ variable "node_selector" {
   type    = map(string)
   default = {}
 }
+
+variable "s3" {
+  description = "Object store for uploaded files: S3 endpoint (null for AWS), bucket, access key."
+  type = object({
+    endpoint   = optional(string)
+    bucket     = string
+    access_key = string
+  })
+}
+
+variable "s3_secret_key" {
+  type      = string
+  sensitive = true
+}

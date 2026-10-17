@@ -1,7 +1,8 @@
-//! Temporal client: starts the Train and Run workflows of de_worker and
-//! reports their state. be_service only starts workflows; de_worker (Python)
-//! executes them. The contract is the workflow type name, the task queue and
-//! the JSON input.
+//! Temporal client: starts the workflows of batch_worker (Train, Run, Report)
+//! and llm_worker (Index) and reports their state. be_service is the platform
+//! API and the only Temporal client; the workers (Python) execute the
+//! workflows, one per task queue. The contract is the workflow type name, the
+//! task queue and the JSON input.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -18,7 +19,10 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_common::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL};
 use tokio::sync::OnceCell;
 
-pub const TASK_QUEUE: &str = "de";
+/// batch_worker: work of models over datasets, as Kubernetes Jobs: Train, Run, Report.
+pub const BATCH_QUEUE: &str = "batch";
+/// llm_worker: events processed in the worker against the LLM server: Index.
+pub const LLM_QUEUE: &str = "llm";
 
 /// One button, one fixed workflow ID: a second press while the first run is
 /// in progress is refused by Temporal instead of starting a parallel run.
@@ -93,14 +97,25 @@ impl Temporal {
     }
 
     pub async fn start(&self, pipeline: Pipeline, input: serde_json::Value) -> Result<Started, StartError> {
+        self.start_workflow(BATCH_QUEUE, pipeline.workflow_type(), pipeline.workflow_id(), input).await
+    }
+
+    /// Starts a workflow under an ID of its own, e.g. `index-<file_id>`: a
+    /// second start while one runs is refused, a start after it ended runs again.
+    pub async fn start_workflow(
+        &self,
+        task_queue: &str,
+        workflow_type: &str,
+        workflow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<Started, StartError> {
         let client = self.client().await.map_err(StartError::Other)?;
-        let options = WorkflowStartOptions::new(TASK_QUEUE, pipeline.workflow_id())
+        let options = WorkflowStartOptions::new(task_queue, workflow_id)
             .id_conflict_policy(WorkflowIdConflictPolicy::Fail)
             .build();
-        match client.start_workflow(UntypedWorkflow::new(pipeline.workflow_type()), json_payload(&input), options).await
-        {
+        match client.start_workflow(UntypedWorkflow::new(workflow_type), json_payload(&input), options).await {
             Ok(handle) => Ok(Started {
-                workflow_id: pipeline.workflow_id().to_owned(),
+                workflow_id: workflow_id.to_owned(),
                 run_id: handle.info().run_id.clone().unwrap_or_default(),
             }),
             Err(WorkflowStartError::AlreadyStarted { .. }) => Err(StartError::AlreadyRunning),
@@ -110,8 +125,13 @@ impl Temporal {
 
     /// State of the latest execution of the pipeline's workflow, None if it never ran.
     pub async fn status(&self, pipeline: Pipeline) -> Result<Option<Status>> {
+        self.status_of(pipeline.workflow_id()).await
+    }
+
+    /// State of the latest execution of a workflow, None if it never ran.
+    pub async fn status_of(&self, workflow_id: &str) -> Result<Option<Status>> {
         let client = self.client().await?;
-        let handle = client.get_workflow_handle::<UntypedWorkflow>(pipeline.workflow_id());
+        let handle = client.get_workflow_handle::<UntypedWorkflow>(workflow_id);
         let description = match handle.describe(WorkflowDescribeOptions::default()).await {
             Ok(d) => d,
             Err(e) if format!("{e:?}").contains("NotFound") => return Ok(None),
@@ -131,7 +151,7 @@ impl Temporal {
 
         let info = description.raw_description.workflow_execution_info.as_ref();
         Ok(Some(Status {
-            workflow_id: pipeline.workflow_id().to_owned(),
+            workflow_id: workflow_id.to_owned(),
             status: format!("{status:?}"),
             started_at: description.start_time().and_then(epoch_seconds),
             closed_at: info.and_then(|i| i.close_time.as_ref()).map(|t| t.seconds as u64),

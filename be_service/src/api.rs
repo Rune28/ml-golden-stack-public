@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -11,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::files::{self, ObjectStore};
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
-use crate::store::{Batch, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats};
-use crate::temporal::{Pipeline, StartError, Started, Status, Temporal};
+use crate::store::{Batch, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats, StoredFile};
+use crate::temporal::{LLM_QUEUE, Pipeline, StartError, Started, Status, Temporal};
 
 /// Upper bound of one Add data: the whole MNIST train split.
 const MAX_BATCH: u64 = 60_000;
@@ -28,6 +30,7 @@ pub struct AppState {
     /// Add data reads the offset, then writes: two at once would take the
     /// same examples. Enough while be_service runs one replica.
     pub ingest_lock: Mutex<()>,
+    pub objects: ObjectStore,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -42,6 +45,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{run_id}/examples", get(examples))
         .route("/api/runs/{run_id}/confusion", get(confusion))
         .route("/api/runs/{run_id}/report", get(digit_report))
+        .route("/api/files", post(upload_file).layer(DefaultBodyLimit::max(files::MAX_FILE_BYTES)).get(list_files))
+        .route("/api/files/{file_id}/index", post(index_file))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -156,6 +161,128 @@ async fn start(state: &AppState, pipeline: Pipeline, input: Value) -> Result<Jso
         }
         Err(StartError::Other(e)) => Err(ApiError::Internal(e)),
     }
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct Uploaded {
+    file_id: String,
+    name: String,
+    size: u64,
+    /// The same bytes were uploaded before or at the same moment: the
+    /// existing file, indexed or not.
+    duplicate: bool,
+    index: Option<Started>,
+}
+
+/// Upload a text file: `POST /api/files?name=notes.md` with the file as the
+/// body. The bytes go to the object store, then a row to `files`, then the
+/// Index workflow starts. file_id is the sha256 of the bytes, so the same
+/// bytes uploaded again, by a retry or by another replica at the same moment,
+/// are the same file: stored once, indexed once.
+async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UploadQuery>,
+    body: Bytes,
+) -> Result<Json<Uploaded>, ApiError> {
+    files::validate(&q.name, &body).map_err(ApiError::BadRequest)?;
+    let file_id = files::sha256_hex(&body);
+
+    if let Some(existing) = state.store.file(&file_id).await? {
+        let StoredFile { file_id, name, size } = existing;
+        return Ok(Json(Uploaded { file_id, name, size, duplicate: true, index: None }));
+    }
+    // Two uploads of the same bytes at once both get here. They write the
+    // same object and the same row (the duplicate merges away), and Temporal
+    // lets only one of them start the index.
+    let object_key = format!("files/{file_id}");
+    let size = body.len() as u64;
+    state.objects.put(&object_key, body).await?;
+    state.store.insert_file(&file_id, &q.name, size, &object_key).await?;
+
+    tracing::info!(%file_id, name = %q.name, size, "file uploaded");
+    let index = match start_index(&state, &file_id).await {
+        Ok(started) => Some(started),
+        // The other upload of these bytes started it.
+        Err(ApiError::Conflict(_)) => None,
+        Err(e) => return Err(e),
+    };
+    Ok(Json(Uploaded { file_id, name: q.name, size, duplicate: index.is_none(), index }))
+}
+
+/// Index a file again: after a failed index, or with a new embedding model.
+async fn index_file(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<String>,
+) -> Result<Json<Started>, ApiError> {
+    let file_id = validate_run_id("file_id", file_id)?;
+    if state.store.file(&file_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("no file {file_id}")));
+    }
+    Ok(Json(start_index(&state, &file_id).await?))
+}
+
+/// One Index workflow per file at a time (`index-<file_id>`); the run_id
+/// names the Job and the chunks it writes.
+async fn start_index(state: &AppState, file_id: &str) -> Result<Started, ApiError> {
+    let input = json!({ "file_id": file_id, "run_id": uuid::Uuid::now_v7().to_string() });
+    match state.temporal.start_workflow(LLM_QUEUE, "Index", &format!("index-{file_id}"), input).await {
+        Ok(started) => Ok(started),
+        Err(StartError::AlreadyRunning) => Err(ApiError::Conflict(format!("file {file_id} is already being indexed"))),
+        Err(StartError::Other(e)) => Err(ApiError::Internal(e)),
+    }
+}
+
+#[derive(Serialize)]
+struct FileView {
+    file_id: String,
+    name: String,
+    size: u64,
+    uploaded_at: u32,
+    /// indexed | indexing | failed | not indexed | unknown (Temporal unreachable)
+    status: String,
+    chunks: u64,
+    embed_model: String,
+    error: Option<String>,
+}
+
+/// Uploaded files with the state of their index: committed chunks from the
+/// run registry, and for a file without them, its Index workflow.
+async fn list_files(State(state): State<Arc<AppState>>) -> Result<Json<Vec<FileView>>, ApiError> {
+    let rows = state.store.files(100).await?;
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (status, error) = if row.chunks > 0 {
+            ("indexed".to_owned(), None)
+        } else {
+            match state.temporal.status_of(&format!("index-{}", row.file_id)).await {
+                Ok(Some(wf)) if wf.status == "Running" => ("indexing".to_owned(), None),
+                Ok(Some(wf)) if wf.error.is_some() => ("failed".to_owned(), wf.error),
+                // Completed, but its marker is not read yet: the next poll shows it.
+                Ok(Some(_)) => ("indexing".to_owned(), None),
+                Ok(None) => ("not indexed".to_owned(), None),
+                Err(e) => {
+                    tracing::warn!(error = format!("{e:#}"), "index status");
+                    ("unknown".to_owned(), None)
+                }
+            }
+        };
+        views.push(FileView {
+            file_id: row.file_id,
+            name: row.name,
+            size: row.size,
+            uploaded_at: row.uploaded_at,
+            status,
+            chunks: row.chunks,
+            embed_model: row.embed_model,
+            error,
+        });
+    }
+    Ok(Json(views))
 }
 
 #[derive(Deserialize)]
@@ -297,6 +424,7 @@ fn validate_run_id(field: &str, id: String) -> Result<String, ApiError> {
 
 pub enum ApiError {
     BadRequest(String),
+    NotFound(String),
     Conflict(String),
     Internal(anyhow::Error),
 }
@@ -320,6 +448,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "request failed");
@@ -346,6 +475,7 @@ mod tests {
             temporal: Temporal::new("http://127.0.0.1:9".into(), "default".into()),
             mlflow: Mlflow::new("http://127.0.0.1:9".into()),
             ingest_lock: Mutex::default(),
+            objects: ObjectStore::new("http://127.0.0.1:9", "pipeline", "key", "secret").unwrap(),
         }))
     }
 
@@ -362,6 +492,20 @@ mod tests {
         assert_eq!(post(r#"{"count": 10, "batch_id": "mnist-test"}"#).await, StatusCode::BAD_REQUEST);
         assert_eq!(post(r#"{"count": 10, "batch_id": "a b"}"#).await, StatusCode::BAD_REQUEST);
         assert_eq!(post(r#"{"batch_id": "x"}"#).await, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    async fn upload(name: &str, body: &'static [u8]) -> StatusCode {
+        let req = Request::post(format!("/api/files?name={name}")).body(Body::from(body)).unwrap();
+        app().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn refuses_files_that_cannot_be_indexed_before_storing_them() {
+        assert_eq!(upload("photo.png", b"x").await, StatusCode::BAD_REQUEST);
+        assert_eq!(upload("empty.md", b"").await, StatusCode::BAD_REQUEST);
+        assert_eq!(upload("binary.txt", &[0xff, 0xfe]).await, StatusCode::BAD_REQUEST);
+        let no_name = Request::post("/api/files").body(Body::from("text")).unwrap();
+        assert_eq!(app().oneshot(no_name).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

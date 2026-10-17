@@ -21,7 +21,7 @@ sequenceDiagram
     participant BE as be_service (Rust)
     participant CH as ClickHouse
     participant T as Temporal
-    participant W as de_worker (Python)
+    participant W as batch_worker (Python)
     participant K as Kubernetes
     participant J as Job (mle-models)
     participant M as MLflow
@@ -30,7 +30,7 @@ sequenceDiagram
     BE->>CH: INSERT batch (batch_id = UUID v7)
     U->>BE: Train model
     BE->>T: start workflow Train (id "train", run_id)
-    T->>W: workflow task on queue "de"
+    T->>W: workflow task on queue "batch"
     W->>K: run_job: create Job train-<run_id>, gpu pool
     K->>J: pod on gold-worker4
     J->>CH: read all samples
@@ -51,7 +51,7 @@ sequenceDiagram
 
 | Decision | Why |
 |---|---|
-| be_service (Rust) is only a Temporal client; de_worker (Python) runs the workflows | the API scales with HTTP load, workers with queue backlog; a worker deploy does not take the API down. Rust and Python share nothing but the workflow name, the task queue and the JSON input |
+| be_service (Rust) is only a Temporal client; batch_worker (Python) runs the workflows | the API scales with HTTP load, workers with queue backlog; a worker deploy does not take the API down. Rust and Python share nothing but the workflow name, the task queue and the JSON input |
 | Add data goes straight from be_service to ClickHouse, Train and Run go through Temporal | inserting a batch is one short call; training is long, needs a GPU, retries and a visible history |
 | Every step is a Kubernetes Job of the mle-models image | isolation, its own image (torch ~1 GB), scheduling on the `gpu` pool by the cluster contract, later queueing through Kueue. The worker stays small |
 | `mle_models/src/mnist` has no I/O, `mle_models/src/jobs` does it | DS code is a pure API: tested without services, reusable outside the pipeline |
@@ -68,7 +68,7 @@ sequenceDiagram
 | Directory | Contents |
 |---|---|
 | `be_service/` | axum API and the page (`static/index.html`), ClickHouse ingest, Temporal client, MLflow REST |
-| `de_worker/src/workflow/` | `Train`, `Run`, `Report`, `contracts.py`, `activities/run_job.py` |
+| `batch_worker/src/workflow/` | `Train`, `Run`, `Report`, `contracts.py`, `activities/run_job.py` |
 | `mle_models/src/` | `mnist` (IDX reader, CNN, train/predict, digit report), `jobs` (train, predict, report, promote) |
 | `db/clickhouse/migrations/` | `ml_data` and its tables |
 | `infra/charts/`, `infra/modules/` | how the applications and services are deployed |

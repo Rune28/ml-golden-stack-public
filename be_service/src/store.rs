@@ -1,4 +1,5 @@
-//! The `ml_data.samples` table. Created by db/clickhouse/migrations, never here.
+//! ClickHouse tables of be_service: `samples` (Add data), `files` (uploads),
+//! and reads of the rest. Created by db/clickhouse/migrations, never here.
 
 use std::ops::Range;
 
@@ -110,6 +111,35 @@ struct SampleRow<'a> {
     pixels: &'a [u8],
 }
 
+/// An uploaded file as stored.
+#[derive(Serialize, Deserialize, Row, Debug)]
+pub struct StoredFile {
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+}
+
+/// An uploaded file with its current index: `chunks` is 0 until an index
+/// run of it is committed to the run registry.
+#[derive(Deserialize, Row, Debug)]
+pub struct FileRow {
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+    pub uploaded_at: u32,
+    pub chunks: u64,
+    pub embed_model: String,
+}
+
+/// `uploaded_at` is left to its DEFAULT now64().
+#[derive(Serialize, Row)]
+struct FileInsert<'a> {
+    file_id: &'a str,
+    name: &'a str,
+    size: u64,
+    object_key: &'a str,
+}
+
 #[derive(Clone)]
 pub struct ClickHouse {
     client: Client,
@@ -194,6 +224,43 @@ impl ClickHouse {
                  WHERE prediction_run_id = ? ORDER BY digit",
             )
             .bind(prediction_run_id)
+            .fetch_all()
+            .await?)
+    }
+
+    /// file_id is the sha256 of the bytes: also "were these bytes uploaded before".
+    pub async fn file(&self, file_id: &str) -> Result<Option<StoredFile>> {
+        Ok(self
+            .client
+            .query("SELECT file_id, name, size FROM files WHERE file_id = ? LIMIT 1")
+            .bind(file_id)
+            .fetch_optional()
+            .await?)
+    }
+
+    /// Written after the bytes are in the object store: a listed file is always there.
+    pub async fn insert_file(&self, file_id: &str, name: &str, size: u64, object_key: &str) -> Result<()> {
+        let mut insert = self.client.insert::<FileInsert>("files").await?;
+        insert.write(&FileInsert { file_id, name, size, object_key }).await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    /// Uploaded files, newest first, each with its latest committed index
+    /// (README, rule 11: a run exists once its marker is in the registry).
+    pub async fn files(&self, limit: u64) -> Result<Vec<FileRow>> {
+        Ok(self
+            .client
+            .query(
+                "SELECT f.file_id AS file_id, f.name AS name, f.size AS size, \
+                 toUInt32(toUnixTimestamp(f.uploaded_at)) AS uploaded_at, r.chunks AS chunks, \
+                 r.embed_model AS embed_model FROM files AS f FINAL \
+                 LEFT JOIN (SELECT parents['file_id'] AS file_id, argMax(rows, started_at) AS chunks, \
+                 argMax(parents['embed_model'], started_at) AS embed_model \
+                 FROM runs FINAL WHERE kind = 'index' GROUP BY file_id) AS r ON r.file_id = f.file_id \
+                 ORDER BY f.uploaded_at DESC LIMIT ?",
+            )
+            .bind(limit)
             .fetch_all()
             .await?)
     }

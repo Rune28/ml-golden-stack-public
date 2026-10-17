@@ -3,7 +3,7 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-# Plain settings; the Secret `secretName` adds CLICKHOUSE_PASSWORD.
+# Plain settings; the Secret `secretName` adds CLICKHOUSE_PASSWORD and the S3 keys.
 env:
   CLICKHOUSE_URL: http://clickhouse.clickhouse.svc:8123
   CLICKHOUSE_USER: platform
@@ -11,6 +11,8 @@ env:
   TEMPORAL_ADDRESS: http://temporal-frontend.temporal.svc:7233
   TEMPORAL_NAMESPACE: default
   MLFLOW_URL: http://mlflow.mlflow.svc:5000
+  S3_BUCKET: pipeline
+  AWS_ENDPOINT_URL_S3: http://seaweedfs.seaweedfs.svc:8333
 secretName: be-service
 
 service:
@@ -23,7 +25,8 @@ replicas: 1
 podAnnotations: {}
 nodeSelector: {}
 
-# MNIST stays gzipped in memory (~11 MB); one Add data unpacks a split (~50 MB).
+# MNIST stays gzipped in memory (~11 MB); one Add data unpacks a split (~50 MB);
+# an upload holds the file (up to 10 MiB) while it goes to the object store.
 resources:
   requests: { cpu: 50m, memory: 64Mi }
   limits: { memory: 160Mi }

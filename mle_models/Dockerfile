@@ -1,4 +1,4 @@
-# Image of the pipeline Jobs: `python -m jobs train|predict|promote ...`.
+# Image of the pipeline Jobs: `python -m jobs train|predict|report|promote ...`.
 # Two stages: uv builds the virtualenv from uv.lock, the runtime stage gets
 # only the venv (no uv, no build cache). torch is the CPU build (see
 # pyproject.toml), ~1 GB of the image.

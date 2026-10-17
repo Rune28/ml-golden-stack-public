@@ -11,14 +11,16 @@ variable "images" {
     changed image rolls the pods and an unchanged one changes nothing.
   EOT
   type = object({
-    be_service = string
-    de_worker  = string
-    mle_models = string
+    be_service   = string
+    batch_worker = string
+    llm_worker   = string
+    mle_models   = string
   })
   default = {
-    be_service = "ghcr.io/rune28/be-service:latest"
-    de_worker  = "ghcr.io/rune28/de-worker:latest"
-    mle_models = "ghcr.io/rune28/mle-models:latest"
+    be_service   = "ghcr.io/rune28/be-service:latest"
+    batch_worker = "ghcr.io/rune28/batch-worker:latest"
+    llm_worker   = "ghcr.io/rune28/llm-worker:latest"
+    mle_models   = "ghcr.io/rune28/mle-models:latest"
   }
 }
 
@@ -38,4 +40,16 @@ variable "temporal_ui_node_port" {
   description = "NodePort of the Temporal UI. Must match `port_mappings.temporal-ui.node_port` of the kind cluster."
   type        = number
   default     = 30080
+}
+
+variable "llm_chat_model" {
+  description = "Chat model on the LLM server (`ollama pull` it on the host first)."
+  type        = string
+  default     = "qwen3:4b"
+}
+
+variable "llm_embed_model" {
+  description = "Embedding model on the LLM server. A new one needs a new index of every file."
+  type        = string
+  default     = "bge-m3"
 }

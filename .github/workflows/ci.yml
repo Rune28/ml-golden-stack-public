@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [de_worker, mle_models]
+        project: [batch_worker, llm_worker, mle_models]
     defaults:
       run:
         working-directory: ${{ matrix.project }}
@@ -84,8 +84,10 @@ jobs:
         include:
           - image: be-service
             context: be_service
-          - image: de-worker
-            context: de_worker
+          - image: batch-worker
+            context: batch_worker
+          - image: llm-worker
+            context: llm_worker
           - image: mle-models
             context: mle_models
     env:

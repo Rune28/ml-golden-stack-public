@@ -1,5 +1,5 @@
-"""The three pipeline steps. Each returns a JSON-serialisable dict, the
-contract with the de_worker activity that started the Job."""
+"""The pipeline steps. Each returns a JSON-serialisable dict, the
+contract with the batch_worker activity that started the Job."""
 
 import json
 import logging

@@ -1,5 +1,6 @@
-# Backend of the pipeline page. Talks to ClickHouse (Add data, stats),
-# Temporal (starts Train and Run) and MLflow (model versions).
+# The platform API: the MNIST page and its API, and uploads of files for
+# retrieval. Talks to ClickHouse, Temporal (the only client), MLflow (model
+# versions) and the object store (uploaded files).
 
 resource "kubernetes_namespace_v1" "this" {
   metadata {
@@ -14,7 +15,9 @@ resource "kubernetes_secret_v1" "this" {
   }
 
   data = {
-    CLICKHOUSE_PASSWORD = var.clickhouse_password
+    CLICKHOUSE_PASSWORD   = var.clickhouse_password
+    AWS_ACCESS_KEY_ID     = var.s3.access_key
+    AWS_SECRET_ACCESS_KEY = var.s3_secret_key
   }
 }
 
@@ -43,14 +46,18 @@ resource "helm_release" "this" {
       repository = local.image[0]
       tag        = local.image[1]
     }
-    env = {
-      CLICKHOUSE_URL      = "http://${var.clickhouse.host}:${var.clickhouse.http_port}"
-      CLICKHOUSE_USER     = var.clickhouse.user
-      CLICKHOUSE_DATABASE = "ml_data"
-      TEMPORAL_ADDRESS    = "http://${var.temporal_address}"
-      TEMPORAL_NAMESPACE  = "default"
-      MLFLOW_URL          = var.mlflow_tracking_uri
-    }
+    env = merge(
+      {
+        CLICKHOUSE_URL      = "http://${var.clickhouse.host}:${var.clickhouse.http_port}"
+        CLICKHOUSE_USER     = var.clickhouse.user
+        CLICKHOUSE_DATABASE = "ml_data"
+        TEMPORAL_ADDRESS    = "http://${var.temporal_address}"
+        TEMPORAL_NAMESPACE  = "default"
+        MLFLOW_URL          = var.mlflow_tracking_uri
+        S3_BUCKET           = var.s3.bucket
+      },
+      var.s3.endpoint == null ? {} : { AWS_ENDPOINT_URL_S3 = var.s3.endpoint },
+    )
     secretName = kubernetes_secret_v1.this.metadata[0].name
     service = {
       type     = var.service.type

@@ -108,12 +108,19 @@ module "temporal" {
   }
 }
 
+# In the cloud this is a model server in the cluster (vLLM) or a managed
+# endpoint instead. Locally Ollama runs on the host, weights on its GPU; the
+# cluster reaches it as http://llm.llm.svc.
+module "llm" {
+  source = "../../modules/llm-local"
+}
+
 # Applications. They start only after the schema they use is migrated.
 
-module "de_worker" {
-  source = "../../modules/de-worker"
+module "batch_worker" {
+  source = "../../modules/batch-worker"
 
-  image            = var.images.de_worker
+  image            = var.images.batch_worker
   job_image        = var.images.mle_models
   temporal_address = module.temporal.frontend_address
 
@@ -136,6 +143,37 @@ module "de_worker" {
   depends_on = [module.clickhouse_migrate]
 }
 
+module "llm_worker" {
+  source = "../../modules/llm-worker"
+
+  image            = var.images.llm_worker
+  temporal_address = module.temporal.frontend_address
+
+  clickhouse = {
+    host      = module.clickhouse.host
+    http_port = module.clickhouse.http_port
+    user      = module.clickhouse.user
+  }
+  clickhouse_password = module.clickhouse.password
+
+  # Uploaded files, written there by be_service.
+  s3 = {
+    endpoint   = module.seaweedfs.endpoint
+    bucket     = "pipeline"
+    access_key = module.seaweedfs.access_key
+  }
+  s3_secret_key = module.seaweedfs.secret_key
+  node_selector = local.platform_node_selector
+
+  llm = {
+    base_url    = module.llm.base_url
+    chat_model  = var.llm_chat_model
+    embed_model = var.llm_embed_model
+  }
+
+  depends_on = [module.clickhouse_migrate]
+}
+
 module "be_service" {
   source = "../../modules/be-service"
 
@@ -149,6 +187,14 @@ module "be_service" {
   }
   clickhouse_password = module.clickhouse.password
   mlflow_tracking_uri = module.mlflow.tracking_uri
+
+  # Uploaded files, next to the results of pipeline Jobs.
+  s3 = {
+    endpoint   = module.seaweedfs.endpoint
+    bucket     = "pipeline"
+    access_key = module.seaweedfs.access_key
+  }
+  s3_secret_key = module.seaweedfs.secret_key
 
   # Exposed on the host through the kind port mapping `app`.
   service = {

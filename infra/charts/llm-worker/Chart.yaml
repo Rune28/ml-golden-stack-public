@@ -1,0 +1,6 @@
+apiVersion: v2
+name: llm-worker
+description: Temporal worker of the `llm` task queue; processes events in the worker against the LLM server, no access to the Kubernetes API
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

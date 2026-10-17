@@ -1,7 +1,7 @@
 """Entry point of the image: `python -m jobs <step> ...`.
 
 Every step prints its result as JSON and, with --result-key, writes it to
-the object store, where the de_worker activity reads it after the Job ends.
+the object store, where the batch_worker activity reads it after the Job ends.
 """
 
 import argparse
@@ -23,7 +23,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(prog="jobs")
     parser.add_argument("--result-key", help="object key for result.json in S3_BUCKET")
-    # de_worker passes when the workflow scheduled the step: the same on every
+    # batch_worker passes when the workflow scheduled the step: the same on every
     # retry, so the run registry orders runs by when they were asked for.
     parser.add_argument(
         "--started-at", type=datetime.fromisoformat, help="logical start of the run, ISO 8601; now when absent"

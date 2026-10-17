@@ -24,7 +24,7 @@ endif
 
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report \
+        images images-load app-status add-data train run report llm-check upload files \
         preflight check-owner host-setup test fmt validate
 
 help:
@@ -45,7 +45,10 @@ help:
 	@echo "train POOL=gpu   start the Train workflow"
 	@echo "run MODEL=champion  start the Run workflow"
 	@echo "report           start the Report workflow on the latest prediction run"
-	@echo "test             unit tests of be_service, de_worker and mle_models"
+	@echo "llm-check        one answer and one embedding from the LLM server, from inside the cluster"
+	@echo "upload FILE=...  upload a text file for retrieval: stored, then indexed (Index workflow)"
+	@echo "files            uploaded files and the state of their index"
+	@echo "test             unit tests of be_service, batch_worker, llm_worker and mle_models"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
 
@@ -125,7 +128,7 @@ platform-status:
 	@$(MAKE) --no-print-directory app-status
 
 app-status:
-	@for ns in seaweedfs clickhouse mlflow de-worker be-service; do \
+	@for ns in seaweedfs clickhouse mlflow batch-worker llm-worker be-service; do \
 	  echo "== $$ns"; $(KUBECTL) get pods,jobs -o wide -n $$ns; echo; done
 
 # The same call the Add data button makes (be_service on the kind port mapping `app`).
@@ -134,21 +137,35 @@ add-data:
 
 train:
 	$(KUBECTL) -n temporal exec deploy/temporal-admintools -- temporal workflow start \
-	  --address temporal-frontend:7233 --task-queue de --type Train --workflow-id train \
+	  --address temporal-frontend:7233 --task-queue batch --type Train --workflow-id train \
 	  --input '{"pool": "$(POOL)"}'
 
 run:
 	$(KUBECTL) -n temporal exec deploy/temporal-admintools -- temporal workflow start \
-	  --address temporal-frontend:7233 --task-queue de --type Run --workflow-id run \
+	  --address temporal-frontend:7233 --task-queue batch --type Run --workflow-id run \
 	  --input '{"model": "$(MODEL)"}'
 
 # Through be_service: it picks the latest prediction run.
 report:
 	@curl -sS -H 'content-type: application/json' -d '{}' http://127.0.0.1:9001/api/report; echo
 
+# Through the adapter in the llm worker pod: checks the server, the cluster's name
+# for it (llm.llm.svc), the models and the adapter in one call.
+llm-check:
+	$(KUBECTL) -n llm-worker exec deploy/llm-worker -- python -m workflow.llm
+
+# The same calls the chat page makes, through the platform API (be_service).
+upload:
+	@test -n "$(FILE)" || { echo "usage: make upload FILE=path/to/notes.md"; exit 1; }
+	@curl -sS --data-binary @$(FILE) --url-query "name=$(notdir $(FILE))" http://127.0.0.1:9001/api/files; echo
+
+files:
+	@curl -sS http://127.0.0.1:9001/api/files; echo
+
 test:
 	cd be_service && cargo test
-	cd de_worker && uv run pytest
+	cd batch_worker && uv run pytest
+	cd llm_worker && uv run pytest
 	cd mle_models && uv run pytest
 
 fmt:

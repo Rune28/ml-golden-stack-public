@@ -1,5 +1,16 @@
 # Backlog
 
+## Next: LLM conveyor
+
+Upload files, index them for retrieval, chat about them with a memory of the conversation. Plan, decisions and slices: [docs/llm-plan.md](docs/llm-plan.md).
+
+- [x] S1 LLM endpoint: Ollama on the host, `modules/llm-local`, the adapter in llm_worker, `make llm-check`
+- [x] S2 Files and index: `files`, `doc_chunks`, workflow `Index`, activity `index_file` in the worker
+- [ ] S3 Conversation: entity workflow `Chat` with Update, `chat_messages`
+- [ ] S4 chat_service: the page for upload and chat on the platform API
+
+Before S1: Ollama installed on the host (no sudo needed). 32 GB of RAM is welcome but not required (see the memory budget in the plan).
+
 ## Local platform
 
 ### Highly available Postgres (CloudNativePG)
@@ -16,11 +27,11 @@ Postgres is a single instance (`modules/postgres-local`, one replica on one node
 
 ### Kueue: queueing pipeline Jobs
 
-`run_job` in de_worker creates Jobs directly, so the scheduler decides alone: with one (simulated) GPU, a second train Job sits `Pending` with no visible queue, priority or quota. Kueue makes the queue explicit and is the same on kind and in the cloud.
+`run_job` in batch_worker creates Jobs directly, so the scheduler decides alone: with one (simulated) GPU, a second train Job sits `Pending` with no visible queue, priority or quota. Kueue makes the queue explicit and is the same on kind and in the cloud.
 
 - [ ] Kueue installed by its helm chart (CRDs handled as in [Helm charts and CRDs](#helm-charts-and-crds))
 - [ ] `ResourceFlavor` per pool from the [cluster contract](README.md#cluster-contract): `cpu` (`node-pool=cpu`) and `gpu` (`node-pool=gpu` + toleration `nvidia.com/gpu`)
-- [ ] `ClusterQueue` with quotas for `cpu`, `memory`, `nvidia.com/gpu`; `LocalQueue` in the `de-worker` namespace
+- [ ] `ClusterQueue` with quotas for `cpu`, `memory`, `nvidia.com/gpu`; `LocalQueue` in the `batch-worker` namespace
 - [ ] `run_job` creates Jobs with the label `kueue.x-k8s.io/queue-name` and `suspend: true`, without its own nodeSelector and tolerations: the flavor sets them
 - [ ] Priorities: `run` (inference) above `train`
 - [ ] Check: two train workflows started together, the second Job waits admitted-but-suspended in the queue, not `Pending` on the scheduler
@@ -49,6 +60,7 @@ A first version was written and never run end to end, then removed. It is in com
 - [ ] NVIDIA device plugin installed in `envs/local` in `nvidia` mode; GPU nodes labelled `nvidia.com/gpu.present=true`
 - [ ] End-to-end check: a pod requesting `nvidia.com/gpu: 1` on the `gpu` pool runs `nvidia-smi` and sees the host GPU
 - [ ] Model step manifests unchanged between `simulated` and `nvidia`
+- [ ] LLM server in a pod on the GPU: a module `llm-serving` (Ollama or vLLM) replaces `llm-local` in `envs/local` and keeps its contract: Service `llm` in namespace `llm`, port 80 named `http`, an OpenAI-compatible API under `/v1`, output `base_url`. Callers do not change. With one GPU shared by the LLM and train Jobs, NVIDIA time-slicing; a server per model (vLLM) needs a separate `LLM_EMBED_BASE_URL` in the adapter
 
 ## Pipeline correctness
 
@@ -74,7 +86,7 @@ Promotion is correct only because the workflow ID `train` lets one Train run at 
 
 - [ ] Train reads a snapshot: first the list of `batch_id`s, then `samples WHERE batch_id IN (...)`, and the same list goes to `train_batches.json`. Today the samples and the batch list are two separate queries, and an Add data between them puts a batch into lineage that the model never saw
 - [ ] Test: Add data during training does not change `train_batches.json` of the running Train
-- [ ] Code version in MLflow: the `mle_models` image (tag and digest) as a run tag; de_worker passes `JOB_IMAGE` to the Job. Today "which code trained v7" has no answer
+- [ ] Code version in MLflow: the `mle_models` image (tag and digest) as a run tag; batch_worker passes `JOB_IMAGE` to the Job. Today "which code trained v7" has no answer
 - [ ] `predictions` inherits the source `batch_id` of each example (README, rule 5), so lineage from a prediction back to its batch is a join
 
 ### Run registry
@@ -89,7 +101,7 @@ Promotion is correct only because the workflow ID `train` lets one Train run at 
 - [ ] `run_id` is checked at the entry (be_service, workflow input): a UUID made by the platform, since the registry assumes it unique across all kinds
 - [ ] Rollout note for 0006–0009: a report written by the previous image after the migration has no marker and stays hidden until reported again. On a long-lived cluster the view switch (0009) goes in the release after every writer commits
 
-### Contracts between be_service and de_worker
+### Contracts between be_service and the workers
 
 - [ ] One schema source (JSON Schema) for workflow inputs and results. Today be_service sends untyped `json!` and a drift shows up only at run time
 - [ ] Contract test in CI on both sides: be_service payloads decode into the `contracts.py` dataclasses, workflow results decode in be_service
@@ -189,7 +201,7 @@ Node drains during upgrades and spot interruptions must not take services down.
 Long-running workflows outlive worker deployments. Changed workflow code replaying an old history fails with a non-determinism error.
 
 - [ ] Workflow changes guarded with `workflow.patched()` or Temporal Worker Versioning
-- [ ] de_worker (Python SDK): workflow code stays deterministic under the SDK sandbox; `workflow.patched("<change-id>")` around changed steps of `Ingest`/`Train`/`Run`, `workflow.deprecate_patch()` once old runs are gone
+- [ ] batch_worker and llm_worker (Python SDK): workflow code stays deterministic under the SDK sandbox; `workflow.patched("<change-id>")` around changed steps of `Ingest`/`Train`/`Run`, `workflow.deprecate_patch()` once old runs are gone
 - [ ] Inputs and results of workflows and `run_job` are versioned dataclasses: new fields only with defaults, so be_service (Rust) and old histories keep decoding
 - [ ] CI replay test: recorded workflow histories replayed against the new worker code
 - [ ] Deployment procedure keeps old workers until workflows started on old code finish (or are migrated)
@@ -214,15 +226,19 @@ Long-running workflows outlive worker deployments. Changed workflow code replayi
 
 On a long-lived cluster someone will run `kubectl edit` "for a minute".
 
-- [ ] GitOps: OpenTofu creates the infrastructure and installs Argo CD (or Flux), Argo CD deploys platform and applications from the repo and reverts manual changes
+- [ ] GitOps: OpenTofu creates the infrastructure and installs Argo CD (or Flux), Argo CD deploys platform and applications from the repo and reverts manual changes (README rule 13). The move:
+  - [ ] Argo CD Applications for `infra/charts/batch-worker`, `infra/charts/llm-worker` and `infra/charts/be-service`, with the same release names and resource names, so Argo CD adopts the running resources instead of recreating them
+  - [ ] `tofu state rm` of the `helm_release`s, so the next apply does not delete them
+  - [ ] `depends_on = [module.clickhouse_migrate]` becomes a sync wave or a PreSync hook
+  - [ ] Settings the application owns (model names) move from OpenTofu variables to a ConfigMap of the chart, with `checksum/config` from the chart template; `pipeline-job` keeps only what the infrastructure owns
 - [ ] Scheduled `tofu plan` in CI, alert when the plan is not empty
 
 ### Access and security
 
 - [ ] No shared admin kubeconfig: access through IAM / SSO (EKS access entries) and RBAC roles
 - [ ] Authentication on be_service: OIDC login (or a session behind an auth proxy such as oauth2-proxy) before any button; Temporal, ClickHouse and MLflow are reachable only from inside the cluster, never through be_service as a proxy
-- [ ] A ClickHouse user per component instead of the one `platform` user (access management, effectively admin) in every Secret: migrations get DDL; be_service gets `INSERT` and `DELETE` on `samples` and `SELECT`; mle_models Jobs get `SELECT` on `samples` and `INSERT`/`DELETE` on `predictions` and `digit_report`; de_worker gets none. Today any model step can `DROP DATABASE ml_data`
-- [ ] de_worker's own settings split from the Jobs' `pipeline-job` ConfigMap and Secret: the worker needs only S3 to read `result.json`, not ClickHouse
+- [ ] A ClickHouse user per component instead of the one `platform` user (access management, effectively admin) in every Secret: migrations get DDL; be_service gets `INSERT` and `DELETE` on `samples` and `SELECT`; mle_models Jobs get `SELECT` on `samples` and `INSERT`/`DELETE` on `predictions` and `digit_report`; llm_worker gets `SELECT` on `files` and `INSERT`/`DELETE` on `doc_chunks`; batch_worker gets none. Today any model step can `DROP DATABASE ml_data`
+- [ ] batch_worker's own settings split from the Jobs' `pipeline-job` ConfigMap and Secret: the worker needs only S3 to read `result.json`, not ClickHouse
 - [ ] NetworkPolicy: deny by default between namespaces, explicit allows
 - [ ] Node images (AMI) updated on a schedule
 - [ ] Container images scanned in CI, builds fail on critical vulnerabilities

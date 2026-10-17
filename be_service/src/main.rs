@@ -1,10 +1,12 @@
 //! be_service: backend of the pipeline page.
 //!
-//! Serves the page and its API: Add data (MNIST batches into ClickHouse),
-//! Train and Run (Temporal workflows executed by de_worker), and the state the
-//! page shows: data, workflows, model versions (MLflow), predictions.
+//! The platform API: the only door into the platform and its only Temporal
+//! client. Serves the MNIST page and its API (Add data, Train, Run, Report,
+//! and the state the page shows), and uploads of files for retrieval (object
+//! store, `files`, the Index workflow).
 
 mod api;
+mod files;
 mod ingest;
 mod mlflow;
 mod mnist;
@@ -43,6 +45,12 @@ async fn main() -> Result<()> {
         ),
         mlflow: mlflow::Mlflow::new(env_or("MLFLOW_URL", "http://127.0.0.1:5000")),
         ingest_lock: Default::default(),
+        objects: files::ObjectStore::new(
+            &env_or("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:8333"),
+            &env_or("S3_BUCKET", "pipeline"),
+            &std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
+            &std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+        )?,
     });
 
     let addr = env_or("LISTEN_ADDR", "0.0.0.0:8080");

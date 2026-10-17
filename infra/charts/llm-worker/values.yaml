@@ -1,0 +1,26 @@
+image:
+  repository: ghcr.io/rune28/llm-worker
+  tag: latest
+  # Locally the image is loaded into the kind nodes, in the cloud pulled from GHCR.
+  pullPolicy: IfNotPresent
+
+temporal:
+  address: temporal-frontend.temporal.svc:7233
+  namespace: default
+
+# Connection settings (ClickHouse, S3, the LLM server): a ConfigMap and a
+# Secret created next to the release.
+env:
+  configMap: llm-worker
+  secret: llm-worker
+
+replicas: 1
+# Changes of these roll the pods: e.g. a checksum of the settings they read at start.
+podAnnotations: {}
+nodeSelector: {}
+
+# index_file holds an uploaded file (up to 10 MiB) and its chunks while it
+# embeds them a batch at a time: ~35 MB per file, up to 4 at once.
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 512Mi }

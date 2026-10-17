@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Application images for the local environment.
 #
-#   images.sh build   build be-service, de-worker, mle-models and write
+#   images.sh build   build be-service, batch-worker, llm-worker, mle-models and write
 #                     infra/envs/local/images.auto.tfvars.json
 #   images.sh load    load those images into the kind worker nodes that miss them
 #   images.sh remote  use images from the registry instead: TAG=sha-abc1234
@@ -18,7 +18,7 @@ CLUSTER=${CLUSTER:-gold}
 TFVARS=infra/envs/local/images.auto.tfvars.json
 
 # image name -> source directory (the variable keys use underscores)
-IMAGES=(be-service:be_service de-worker:de_worker mle-models:mle_models)
+IMAGES=(be-service:be_service batch-worker:batch_worker llm-worker:llm_worker mle-models:mle_models)
 
 write_tfvars() { # name=ref ...
   {
