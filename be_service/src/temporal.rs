@@ -7,12 +7,15 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use temporalio_client::errors::{WorkflowGetResultError, WorkflowStartError};
+use temporalio_client::errors::{
+    WorkflowGetResultError, WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError,
+};
 use temporalio_client::{
-    Client, ClientOptions, ConnectionOptions, UntypedWorkflow, Url, WorkflowDescribeOptions, WorkflowExecutionStatus,
-    WorkflowGetResultOptions, WorkflowIdConflictPolicy, WorkflowStartOptions,
+    Client, ClientOptions, ConnectionOptions, UntypedUpdate, UntypedWorkflow, Url, WorkflowDescribeOptions,
+    WorkflowExecutionStatus, WorkflowGetResultOptions, WorkflowIdConflictPolicy, WorkflowStartOptions,
+    WorkflowUpdateWithStartOptions,
 };
 use temporalio_common::data_converters::RawValue;
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -21,7 +24,7 @@ use tokio::sync::OnceCell;
 
 /// batch_worker: work of models over datasets, as Kubernetes Jobs: Train, Run, Report.
 pub const BATCH_QUEUE: &str = "batch";
-/// llm_worker: events processed in the worker against the LLM server: Index.
+/// llm_worker: events processed in the worker against the LLM server: Index, Chat.
 pub const LLM_QUEUE: &str = "llm";
 
 /// One button, one fixed workflow ID: a second press while the first run is
@@ -73,6 +76,12 @@ pub enum StartError {
     Other(anyhow::Error),
 }
 
+pub enum UpdateError {
+    /// The workflow refused the message or a step of the answer failed.
+    Failed(String),
+    Other(anyhow::Error),
+}
+
 pub struct Temporal {
     address: String,
     namespace: String,
@@ -120,6 +129,46 @@ impl Temporal {
             }),
             Err(WorkflowStartError::AlreadyStarted { .. }) => Err(StartError::AlreadyRunning),
             Err(e) => Err(StartError::Other(e.into())),
+        }
+    }
+
+    /// A message to the chat `chat-<chat_id>`, which starts with its first
+    /// message (UpdateWithStart), and the answer, once it is recorded. The
+    /// Update ID is the answer's run_id: a call retried with it is answered
+    /// once.
+    pub async fn send_message(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        text: &str,
+    ) -> Result<serde_json::Value, UpdateError> {
+        let client = self.client().await.map_err(UpdateError::Other)?;
+        let options = WorkflowUpdateWithStartOptions::new(
+            LLM_QUEUE,
+            format!("chat-{chat_id}"),
+            WorkflowIdConflictPolicy::UseExisting,
+        )
+        .update_id(run_id)
+        .build();
+        let input = serde_json::json!({ "chat_id": chat_id });
+        let message = serde_json::json!({ "text": text, "run_id": run_id });
+        let result = client
+            .execute_update_with_start_workflow(
+                UntypedWorkflow::new("Chat"),
+                json_payload(&input),
+                UntypedUpdate::<UntypedWorkflow>::new("send_message"),
+                json_payload(&message),
+                options,
+            )
+            .await;
+        match result {
+            Ok(answer) => {
+                from_json_payload(answer).ok_or_else(|| UpdateError::Other(anyhow!("an answer without a payload")))
+            }
+            Err(WorkflowUpdateWithStartError::Update(WorkflowUpdateError::Failed(failure))) => {
+                Err(UpdateError::Failed(failure_message(&format!("{failure:?}"))))
+            }
+            Err(e) => Err(UpdateError::Other(e.into())),
         }
     }
 

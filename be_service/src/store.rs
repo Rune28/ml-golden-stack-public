@@ -1,6 +1,7 @@
 //! ClickHouse tables of be_service: `samples` (Add data), `files` (uploads),
 //! and reads of the rest. Created by db/clickhouse/migrations, never here.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use anyhow::Result;
@@ -117,6 +118,30 @@ pub struct StoredFile {
     pub file_id: String,
     pub name: String,
     pub size: u64,
+}
+
+/// A conversation, for the chat page to go back to: its first question as a title.
+#[derive(Serialize, Deserialize, Row, Debug)]
+pub struct ChatSummary {
+    pub chat_id: String,
+    pub title: String,
+    pub turns: u32,
+    pub last_at: u32,
+}
+
+/// One committed message; sources are (file_id, index_run_id, chunk_id).
+#[derive(Deserialize, Row, Debug)]
+pub struct ChatMessageRow {
+    pub turn: u32,
+    pub role: String,
+    pub text: String,
+    pub sources: Vec<(String, String, u32)>,
+}
+
+#[derive(Deserialize, Row)]
+struct FileName {
+    file_id: String,
+    name: String,
 }
 
 /// An uploaded file with its current index: `chunks` is 0 until an index
@@ -244,6 +269,68 @@ impl ClickHouse {
         insert.write(&FileInsert { file_id, name, size, object_key }).await?;
         insert.end().await?;
         Ok(())
+    }
+
+    /// The index markers of a file, of every run and model: its chunks
+    /// drop out of doc_chunks_current at once.
+    pub async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
+        self.client
+            .query("DELETE FROM runs WHERE kind = 'index' AND parents['file_id'] = ?")
+            .bind(file_id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_chunks(&self, file_id: &str) -> Result<()> {
+        self.client.query("DELETE FROM doc_chunks WHERE file_id = ?").bind(file_id).execute().await?;
+        Ok(())
+    }
+
+    pub async fn delete_file(&self, file_id: &str) -> Result<()> {
+        self.client.query("DELETE FROM files WHERE file_id = ?").bind(file_id).execute().await?;
+        Ok(())
+    }
+
+    /// Conversations, the latest first. Through chat_messages_committed: a
+    /// turn written halfway never shows (README, rule 11).
+    pub async fn chats(&self, limit: u64) -> Result<Vec<ChatSummary>> {
+        Ok(self
+            .client
+            .query(
+                "SELECT chat_id, argMinIf(text, turn, role = 'user') AS title, toUInt32(max(turn)) AS turns, \
+                 toUInt32(toUnixTimestamp(max(created_at))) AS last_at FROM chat_messages_committed \
+                 GROUP BY chat_id ORDER BY last_at DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all()
+            .await?)
+    }
+
+    /// The committed turns of one conversation, in order, the question before its answer.
+    pub async fn chat_messages(&self, chat_id: &str) -> Result<Vec<ChatMessageRow>> {
+        Ok(self
+            .client
+            .query(
+                // The client cannot read named tuples (the column type in 0013): cast to
+                // a plain one, the same values.
+                "SELECT turn, role, text, CAST(sources, 'Array(Tuple(String, String, UInt32))') AS sources \
+                 FROM chat_messages_committed WHERE chat_id = ? ORDER BY turn, role = 'assistant'",
+            )
+            .bind(chat_id)
+            .fetch_all()
+            .await?)
+    }
+
+    /// Names of files by id; a deleted file has none.
+    pub async fn file_names(&self, file_ids: &[String]) -> Result<HashMap<String, String>> {
+        let rows: Vec<FileName> = self
+            .client
+            .query("SELECT file_id, name FROM files FINAL WHERE has(?, file_id)")
+            .bind(file_ids)
+            .fetch_all()
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.file_id, r.name)).collect())
     }
 
     /// Uploaded files, newest first, each with its latest committed index

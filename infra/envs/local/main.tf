@@ -205,3 +205,13 @@ module "be_service" {
 
   depends_on = [module.clickhouse_migrate]
 }
+
+# The product: the chat page, on the platform API. Reached on the host with
+# `make chat-ui` (a port-forward): the kind cluster has no free port mapping.
+module "chat_service" {
+  source = "../../modules/chat-service"
+
+  image            = var.images.chat_service
+  platform_api_url = module.be_service.url
+  node_selector    = local.platform_node_selector
+}

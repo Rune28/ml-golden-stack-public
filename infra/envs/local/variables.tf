@@ -12,12 +12,14 @@ variable "images" {
   EOT
   type = object({
     be_service   = string
+    chat_service = string
     batch_worker = string
     llm_worker   = string
     mle_models   = string
   })
   default = {
     be_service   = "ghcr.io/rune28/be-service:latest"
+    chat_service = "ghcr.io/rune28/chat-service:latest"
     batch_worker = "ghcr.io/rune28/batch-worker:latest"
     llm_worker   = "ghcr.io/rune28/llm-worker:latest"
     mle_models   = "ghcr.io/rune28/mle-models:latest"

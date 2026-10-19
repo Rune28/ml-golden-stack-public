@@ -9,12 +9,35 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from workflow import TASK_QUEUE, IndexWorkflow
+from workflow import TASK_QUEUE, ChatWorkflow, IndexWorkflow
+from workflow.activities.chat import Chatter
 from workflow.activities.index import Indexer
 
-# The activities are blocking and wait on the LLM server. Each holds a file
-# and its chunks (tens of MB), so a few at a time.
+# The activities are blocking and wait on the LLM server. index_file holds a
+# file and its chunks (tens of MB), so a few at a time.
 MAX_CONCURRENT = 4
+
+
+async def serve(worker, stop: asyncio.Event) -> None:
+    """Runs the worker until SIGTERM, or until the worker itself ends.
+
+    A worker that fails must take the process down with it. Right after the
+    platform is created the Temporal namespace may not exist yet: the worker
+    then fails at once, and the process exits so that Kubernetes starts it
+    again, instead of a dead worker sitting in a Running pod with nobody
+    polling the queue. The same in batch_worker/src/worker/__main__.py.
+    """
+    running = asyncio.create_task(worker.run())
+    stopping = asyncio.create_task(stop.wait())
+    await asyncio.wait({running, stopping}, return_when=asyncio.FIRST_COMPLETED)
+    if running.done():
+        stopping.cancel()
+        running.result()  # the worker's error, if it failed
+        raise RuntimeError("the worker stopped by itself")
+    # SIGTERM: stop polling, let running activities finish or be cut; a cut
+    # one is retried on another worker.
+    await worker.shutdown()
+    await running
 
 
 async def main() -> None:
@@ -23,16 +46,17 @@ async def main() -> None:
 
     client = await Client.connect(address, namespace=namespace)
     indexer = Indexer.from_env()
+    chatter = Chatter.from_env()
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[IndexWorkflow],
-        activities=[indexer.index_file],
+        workflows=[IndexWorkflow, ChatWorkflow],
+        activities=[indexer.index_file, chatter.retrieve, chatter.generate, chatter.record],
         activity_executor=ThreadPoolExecutor(MAX_CONCURRENT),
         max_concurrent_activities=MAX_CONCURRENT,
     )
 
-    # Kubernetes stops a pod with SIGTERM. Leaving `async with` stops polling;
+    # Kubernetes stops a pod with SIGTERM: serve() then stops polling;
     # running activities are cut and retried on another worker, where they
     # rewrite their own partial rows.
     stop = asyncio.Event()
@@ -40,9 +64,8 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    async with worker:
-        logging.info("polling task queue %s on %s, namespace %s, LLM server %s", TASK_QUEUE, address, namespace, indexer.llm.base_url)
-        await stop.wait()
+    logging.info("polling task queue %s on %s, namespace %s, LLM server %s", TASK_QUEUE, address, namespace, indexer.llm.base_url)
+    await serve(worker, stop)
     logging.info("worker stopped")
 
 

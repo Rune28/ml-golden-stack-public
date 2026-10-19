@@ -1,12 +1,13 @@
 //! HTTP API for the pipeline page.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,11 +17,15 @@ use crate::files::{self, ObjectStore};
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
-use crate::store::{Batch, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats, StoredFile};
-use crate::temporal::{LLM_QUEUE, Pipeline, StartError, Started, Status, Temporal};
+use crate::store::{
+    Batch, ChatSummary, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats, StoredFile,
+};
+use crate::temporal::{LLM_QUEUE, Pipeline, StartError, Started, Status, Temporal, UpdateError};
 
 /// Upper bound of one Add data: the whole MNIST train split.
 const MAX_BATCH: u64 = 60_000;
+/// Upper bound of one chat message, the same as the Chat workflow's.
+const MAX_MESSAGE_CHARS: usize = 4000;
 
 pub struct AppState {
     pub store: ClickHouse,
@@ -46,7 +51,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{run_id}/confusion", get(confusion))
         .route("/api/runs/{run_id}/report", get(digit_report))
         .route("/api/files", post(upload_file).layer(DefaultBodyLimit::max(files::MAX_FILE_BYTES)).get(list_files))
+        .route("/api/files/{file_id}", delete(delete_file))
         .route("/api/files/{file_id}/index", post(index_file))
+        .route("/api/chats", post(new_chat).get(list_chats))
+        .route("/api/chats/{chat_id}/messages", post(send_message).get(chat_history))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -199,7 +207,7 @@ async fn upload_file(
     // Two uploads of the same bytes at once both get here. They write the
     // same object and the same row (the duplicate merges away), and Temporal
     // lets only one of them start the index.
-    let object_key = format!("files/{file_id}");
+    let object_key = files::object_key(&file_id);
     let size = body.len() as u64;
     state.objects.put(&object_key, body).await?;
     state.store.insert_file(&file_id, &q.name, size, &object_key).await?;
@@ -224,6 +232,26 @@ async fn index_file(
         return Err(ApiError::NotFound(format!("no file {file_id}")));
     }
     Ok(Json(start_index(&state, &file_id).await?))
+}
+
+/// Delete a file and everything made from it: `DELETE /api/files/<file_id>`.
+/// Refused while the file is being indexed: an index committed after the
+/// deletion would bring its chunks back (retrieval also skips chunks of
+/// files that are gone). A call retried after a failure finishes the job.
+async fn delete_file(State(state): State<Arc<AppState>>, Path(file_id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let file_id = validate_run_id("file_id", file_id)?;
+    if state.store.file(&file_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("no file {file_id}")));
+    }
+    // Temporal unreachable is an error, not "not indexing": no deletion on a guess.
+    if let Some(index) = state.temporal.status_of(&format!("index-{file_id}")).await?
+        && index.status == "Running"
+    {
+        return Err(ApiError::Conflict(format!("file {file_id} is being indexed: delete it when that is done")));
+    }
+    files::delete(&files::Stores { store: &state.store, objects: &state.objects }, &file_id).await?;
+    tracing::info!(%file_id, "file deleted");
+    Ok(Json(json!({ "file_id": file_id, "deleted": true })))
 }
 
 /// One Index workflow per file at a time (`index-<file_id>`); the run_id
@@ -283,6 +311,102 @@ async fn list_files(State(state): State<Arc<AppState>>) -> Result<Json<Vec<FileV
         });
     }
     Ok(Json(views))
+}
+
+#[derive(Serialize)]
+struct NewChat {
+    chat_id: String,
+}
+
+/// A new conversation: only its id, made here. The Chat workflow starts with
+/// the first message.
+async fn new_chat() -> Json<NewChat> {
+    Json(NewChat { chat_id: uuid::Uuid::now_v7().to_string() })
+}
+
+/// The conversations, the latest first, for the chat page to go back to one.
+async fn list_chats(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ChatSummary>>, ApiError> {
+    Ok(Json(state.store.chats(50).await?))
+}
+
+#[derive(Serialize)]
+struct SourceView {
+    file_id: String,
+    index_run_id: String,
+    chunk_id: u32,
+    /// Empty once the file is deleted: the answer keeps the keys it used.
+    name: String,
+}
+
+#[derive(Serialize)]
+struct MessageView {
+    turn: u32,
+    role: String,
+    text: String,
+    sources: Vec<SourceView>,
+}
+
+/// The committed turns of a chat, in order: what the chat page shows when it
+/// opens one. A chat with no committed turn yet has none.
+async fn chat_history(
+    State(state): State<Arc<AppState>>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<Vec<MessageView>>, ApiError> {
+    let chat_id = validate_run_id("chat_id", chat_id)?;
+    let rows = state.store.chat_messages(&chat_id).await?;
+    let file_ids: Vec<String> = rows
+        .iter()
+        .flat_map(|r| r.sources.iter().map(|(f, _, _)| f.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let names = if file_ids.is_empty() { Default::default() } else { state.store.file_names(&file_ids).await? };
+    let messages = rows
+        .into_iter()
+        .map(|r| MessageView {
+            turn: r.turn,
+            role: r.role,
+            text: r.text,
+            sources: r
+                .sources
+                .into_iter()
+                .map(|(file_id, index_run_id, chunk_id)| SourceView {
+                    name: names.get(&file_id).cloned().unwrap_or_default(),
+                    file_id,
+                    index_run_id,
+                    chunk_id,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(Json(messages))
+}
+
+#[derive(Deserialize)]
+struct MessageRequest {
+    text: String,
+}
+
+/// One message of a chat, answered from the uploaded files:
+/// `POST /api/chats/<chat_id>/messages` with `{"text": "..."}`. Waits for the
+/// answer: seconds to a minute for a small model on the local GPU.
+async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Path(chat_id): Path<String>,
+    Json(req): Json<MessageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let chat_id = validate_run_id("chat_id", chat_id)?;
+    let text = req.text.trim();
+    if text.is_empty() || text.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(ApiError::BadRequest(format!("text: 1-{MAX_MESSAGE_CHARS} characters")));
+    }
+    // The answer's run, made where the request enters the platform (principle 5).
+    let run_id = uuid::Uuid::now_v7().to_string();
+    match state.temporal.send_message(&chat_id, &run_id, text).await {
+        Ok(answer) => Ok(Json(answer)),
+        Err(UpdateError::Failed(message)) => Err(ApiError::Upstream(message)),
+        Err(UpdateError::Other(e)) => Err(ApiError::Internal(e)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -426,6 +550,8 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
+    /// A workflow behind the API failed: the message is its error.
+    Upstream(String),
     Internal(anyhow::Error),
 }
 
@@ -450,6 +576,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
             ApiError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned())
@@ -506,6 +633,43 @@ mod tests {
         assert_eq!(upload("binary.txt", &[0xff, 0xfe]).await, StatusCode::BAD_REQUEST);
         let no_name = Request::post("/api/files").body(Body::from("text")).unwrap();
         assert_eq!(app().oneshot(no_name).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn message(chat_id: &str, body: &str) -> StatusCode {
+        let req = Request::post(format!("/api/chats/{chat_id}/messages"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()));
+        app().oneshot(req.unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn refuses_chat_messages_before_reaching_temporal() {
+        assert_eq!(message("chat-1", r#"{"text": "   "}"#).await, StatusCode::BAD_REQUEST);
+        let long = format!(r#"{{"text": "{}"}}"#, "a".repeat(MAX_MESSAGE_CHARS + 1));
+        assert_eq!(message("chat-1", &long).await, StatusCode::BAD_REQUEST);
+        assert_eq!(message("a%20b", r#"{"text": "hi"}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(message("chat-1", r#"{}"#).await, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_malformed_file_id_before_any_lookup() {
+        let req = Request::delete("/api/files/a%20b").body(Body::empty()).unwrap();
+        assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_malformed_chat_id_before_reading_history() {
+        let req = Request::get("/api/chats/a%20b/messages").body(Body::empty()).unwrap();
+        assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_new_chat_gets_a_uuid() {
+        let res = app().oneshot(Request::post("/api/chats").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        let chat: Value = serde_json::from_slice(&body).unwrap();
+        assert!(uuid::Uuid::parse_str(chat["chat_id"].as_str().unwrap()).is_ok());
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ The decisions the stack is built on, in the order they were made. Each rule says
     *Here:* migrations 0006–0009, `commit_run` in `mle_models/src/jobs/clickhouse.py` (batch, `--started-at` from `run_job`) and in `llm_worker/src/workflow/activities/index.py` (stream, the activity's scheduled time); be_service reads `digit_report_latest`. *Not yet:* markers for batches, train reading committed batches only, views for the other reads of be_service, cleanup of uncommitted rows ([Run registry](BACKLOG.md#run-registry)).
 
 12. **Events are a stream: processed in the worker as they come, against a model server.** An uploaded file and a chat message are each one small piece of work, done in seconds: starting a pod and loading a model for each would take longer than the work. They run as activities of the worker that call a long-running model server, a batch of chunks at a time, with a heartbeat after each, so the worker never holds more than one batch of vectors. The same operation over the whole dataset is batch again (rule 3): one uploaded file is indexed in the worker, the whole corpus for a new model in a Job. The model server is reached through one name in the cluster, `llm.llm.svc`, and one adapter with an OpenAI-compatible API, so the server (Ollama on the host, vLLM in the cluster, a managed endpoint) changes without changing the callers.
-    *Here:* `infra/modules/llm-local`, `llm_worker/src/workflow/llm.py`, `index_file` in `llm_worker/src/workflow/activities/index.py`, `make llm-check`. *Next:* the chat answer ([docs/llm-plan.md](docs/llm-plan.md)); *not yet:* the corpus re-index as a Job.
+    *Here:* `infra/modules/llm-local`, `llm_worker/src/workflow/llm.py`, `index_file` in `llm_worker/src/workflow/activities/index.py`, the chat in `llm_worker/src/workflow/chat.py`, `make llm-check`. *Not yet:* the corpus re-index as a Job ([docs/llm-plan.md](docs/llm-plan.md)).
 
 13. **There are two release mechanics: one `tofu apply` for the MVP, GitOps for applications once the team outgrows it.** Today one apply of `envs/<name>` releases the infrastructure and the applications (`helm_release`) together: one dependency graph (migrations before applications), infrastructure outputs passed straight to the applications. A changed setting is an apply too, but only the resources whose values changed are updated, and a checksum of the settings on the pod rolls it. This fits one environment and a small team. The split comes when application releases queue behind the state lock, a second environment appears, or CI must not hold the whole state just to bump an image tag: OpenTofu keeps the infrastructure and installs Argo CD, Argo CD deploys the applications from the repo. To keep that move about a week of work, applications get the values the infrastructure owns (hosts, buckets, passwords) only through named ConfigMaps and Secrets, which stay the contract between the two layers, and nothing else of OpenTofu's goes into `helm_release` values.
     *Here:* ConfigMaps and Secrets `pipeline-job` in `infra/modules/batch-worker` and `llm-worker` in `infra/modules/llm-worker`, `checksum/settings` in those modules and in `infra/modules/be-service`. *Not yet:* Argo CD; model names, which the application owns, are still OpenTofu variables written into the `llm-worker` ConfigMap ([Drift detection](BACKLOG.md#drift-detection)).
@@ -52,11 +52,12 @@ The decisions the stack is built on, in the order they were made. Each rule says
 | Directory | Purpose |
 |---|---|
 | `infra/clusters/kind` | local kind cluster |
-| `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `llm-local`, `batch-worker`, `llm-worker`, `be-service` |
-| `infra/charts` | Helm charts of our own applications: `batch-worker`, `llm-worker`, `be-service` |
+| `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `llm-local`, `batch-worker`, `llm-worker`, `be-service`, `chat-service` |
+| `infra/charts` | Helm charts of our own applications: `batch-worker`, `llm-worker`, `be-service`, `chat-service` |
 | `infra/envs/local` | local environment: wires the modules onto the kind cluster |
 | `db/clickhouse/migrations` | ClickHouse schema (golang-migrate, one statement per file) |
 | `be_service` | Rust: the platform API and the MNIST page. Adds data to ClickHouse, stores uploaded files, starts workflows in Temporal (its only client) |
+| `chat_service` | Rust: the chat product. The page to upload files and ask about them, and a thin API that forwards each call to the platform API and turns its failures into messages; no Temporal, no storage |
 | `batch_worker` | Python: Temporal worker of the queue `batch`. Workflows `Train`, `Run`, `Report`, activity `run_job` that runs each step as a Kubernetes Job |
 | `llm_worker` | Python: Temporal worker of the queue `llm`. Workflow `Index`, activity `index_file` that indexes an uploaded file in the worker; `rag` (chunking, no I/O); the LLM adapter |
 | `mle_models` | Python: `mnist` (model code, no I/O) and `jobs` (the Job entry points: train, predict, report, promote) |
@@ -263,21 +264,32 @@ Contracts that hold the pieces together:
 - `run_job` names the Job `<step>-<run_id>`: a retried activity finds the Job it created instead of starting the step again. Every step is idempotent: a partial batch or prediction run is rewritten, a complete one skipped.
 - The `mnist` package has no I/O; `jobs` does ClickHouse, MLflow and S3 around it.
 
-## Retrieval
+## Retrieval and chat
 
-Files uploaded through the platform API become chunks with embeddings in ClickHouse; the chat (the next slice of [docs/llm-plan.md](docs/llm-plan.md)) answers from them.
+Files uploaded through the platform API become chunks with embeddings in ClickHouse; a chat answers questions from them and remembers the conversation ([docs/llm-plan.md](docs/llm-plan.md)).
 
 ```bash
 make upload FILE=README.md   # stored in the object store, a row in ml_data.files, workflow Index
 make files                   # every file with its index state: indexing, indexed (chunks, model), failed
+make chat Q="what is S3?"    # a new chat: the answer, its sources and CHAT=<id>
+make chat CHAT=<id> Q="and the next one?"   # goes on in that chat
+make chat-ui                 # the chat page (chat_service) on http://127.0.0.1:9002, restarting itself
+make chat-ui-service         # the same as a systemd user service: always on :9002, after reboots too
 ```
 
 | Step | Who | Where the result goes |
 |---|---|---|
 | Upload | be_service: checks (text, up to 10 MiB, UTF-8), sha256 as `file_id`, object store, then `files` | `pipeline/files/<file_id>`, `ml_data.files` |
-| Index | Temporal `Index` → activity `index_file` in the worker (no Job, rule 12): chunks of about 1,000 characters, embedded 32 at a time by the LLM server | `ml_data.doc_chunks` under the run's `run_id`, marker `kind='index'`; readers use `doc_chunks_current` |
+| Index | Temporal `Index` → activity `index_file` in the worker (no Job, rule 12): chunks of about 1,000 characters, each text once, embedded 32 at a time by the LLM server | `ml_data.doc_chunks` under the run's `run_id`, marker `kind='index'`; readers use `doc_chunks_current` |
+| Chat | be_service: `POST /api/chats/<chat_id>/messages` → UpdateWithStart of the entity workflow `chat-<chat_id>`; activities `retrieve` (top 5 of `doc_chunks_current` for the current embedding model, files that exist only, each text once), `generate` (the chunks, the last 6 messages, the question), `record` | `ml_data.chat_messages` under the answer's `run_id` with its sources, marker `kind='answer'` |
 
 The same bytes uploaded again return the file already there. A file is indexed again with `POST /api/files/<file_id>/index`: after a failure, or with a new embedding model, whose vectors live next to the old ones until the new index is committed.
+
+`DELETE /api/files/<file_id>` (a Delete button on the chat page) removes a file and what was made from it, in this order: its index markers (it leaves every answer at once), its chunks, its bytes, its row (while the row is there, a retried call finds the file and finishes). It is refused while the file is being indexed; answers recorded earlier keep the keys of the chunks they used.
+
+The open chat is in the page address (`#chat=<id>`): a reload or a link opens it again with its history (`GET /api/chats/<chat_id>/messages`, the committed turns from the view `chat_messages_committed`), and the page lists earlier chats (`GET /api/chats`).
+
+A chat answers one message at a time, in order, so each answer sees the ones before it. Between messages the workflow only waits; after 50 answers it continues as new with the last 6 messages, so its Temporal history stays bounded, while every message stays in `chat_messages`.
 
 ## Platform services
 
@@ -312,6 +324,10 @@ Description=Ollama, listening only on the kind bridge
 
 [Service]
 Environment=OLLAMA_HOST=172.18.0.1:11434
+# The default 4096 tokens is less than a chat answer needs (five chunks,
+# the conversation, the model thinking): past it the server drops the
+# start of the prompt, the documents, without an error.
+Environment=OLLAMA_CONTEXT_LENGTH=8192
 ExecStart=%h/.local/bin/ollama serve
 # The kind bridge appears only after docker creates it: retry until it does.
 Restart=always
@@ -323,7 +339,7 @@ UNIT
 systemctl --user daemon-reload && systemctl --user enable --now ollama
 
 export OLLAMA_HOST=172.18.0.1:11434
-ollama pull qwen3:4b   # chat, ~2.5 GB of VRAM
+ollama pull qwen3:4b   # chat, ~3.5 GB of VRAM with the 8192-token context
 ollama pull bge-m3     # embeddings, multilingual, 1024 dimensions, ~1.2 GB
 make llm-check         # one answer and one embedding from inside the cluster
 ```
@@ -335,6 +351,7 @@ The models are variables of `envs/local` (`llm_chat_model`, `llm_embed_model`): 
 | Application | Chart | Runs |
 |---|---|---|
 | be-service | `infra/charts/be-service` | one replica (Add data is serialized in-process), NodePort 30901 |
+| chat-service | `infra/charts/chat-service` | ClusterIP only, reached through a port-forward (`make chat-ui` or `make chat-ui-service`); no service account token in the pod. On a server: an Ingress in front of the same Service |
 | batch-worker | `infra/charts/batch-worker` | Role to create, watch and delete Jobs and read pod logs in `batch-worker` only |
 | llm-worker | `infra/charts/llm-worker` | none: no Role, no service account token in the pod |
 | pipeline Jobs | created by `run_job` | `train` on the `gpu` pool (toleration + `nvidia.com/gpu: 1`), `predict` and `promote` on `cpu`; `ttlSecondsAfterFinished: 3600` |

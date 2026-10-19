@@ -36,11 +36,15 @@ jobs:
       - run: uv run pytest
 
   rust:
-    name: test be_service
+    name: test ${{ matrix.project }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [be_service, chat_service]
     defaults:
       run:
-        working-directory: be_service
+        working-directory: ${{ matrix.project }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -48,8 +52,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: be_service
-      # The Temporal SDK compiles protobuf definitions at build time.
+          workspaces: ${{ matrix.project }}
+      # The Temporal SDK of be_service compiles protobuf definitions at build time.
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
@@ -84,6 +88,8 @@ jobs:
         include:
           - image: be-service
             context: be_service
+          - image: chat-service
+            context: chat_service
           - image: batch-worker
             context: batch_worker
           - image: llm-worker

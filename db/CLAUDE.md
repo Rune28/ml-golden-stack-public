@@ -11,19 +11,19 @@ How principles 4–6 of the root CLAUDE.md are implemented for the tables in `ml
 
 ## Keys of run outputs
 
-Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`):
+Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`, `chat_messages`):
 
 - `run_id` is the run that wrote the rows: the unit of rewrite and of idempotency.
 - The keys of the inputs keep their name downstream as `<parent>_run_id` (`prediction_run_id`), so lineage is a join. Source data from be_service uses `batch_id`.
 - A writer deletes or rewrites rows filtered by its own `run_id`.
 
-Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes.
+Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. Deleting a file (be_service) removes what was made from it in reader order: index markers, chunks, the object, the row last.
 
 ## Run registry and views
 
 - A step writes its rows, then commits a marker to `ml_data.runs` (`commit_run`). The marker is written by the platform layer (the `jobs` package in a Job, or the activity in the worker), not by model code.
 - `started_at` is the logical start: when the workflow scheduled the step, the same on retries. The latest run is chosen by it, not by the time of an insert.
-- Readers of results (be_service, retrieval) read views over `runs`, such as `digit_report_latest` and `doc_chunks_current`, so a table can change its layout without them noticing. A writer checking its own progress reads its table directly, and so can ad-hoc and debugging queries.
+- Readers of results (be_service, retrieval) read views over `runs`, such as `digit_report_latest`, `doc_chunks_current` and `chat_messages_committed`, so a table can change its layout without them noticing. A writer checking its own progress reads its table directly, and so can ad-hoc and debugging queries.
 
 ## ClickHouse specifics
 

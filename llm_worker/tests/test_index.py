@@ -87,6 +87,17 @@ def test_a_new_run_is_embedded_batch_by_batch_and_committed_last():
     assert (result.name, result.chunks, result.chars, result.embed_model) == ("notes.md", 3, len(TEXT), "bge-m3")
 
 
+def test_a_file_that_repeats_itself_is_indexed_once():
+    clickhouse = FakeClickHouse()
+    twice = "\n\n".join(c * 600 for c in "abab").encode()
+
+    result, llm, _, _ = run(clickhouse, twice)
+
+    written = [row for table, rows in clickhouse.writes if table == "doc_chunks" for row in rows]
+    assert [(row[2], row[4][0]) for row in written] == [(0, "a"), (1, "b")]
+    assert result.chunks == 2 and result.chars == len(twice)
+
+
 def test_a_retry_after_a_complete_write_only_commits():
     clickhouse = FakeClickHouse(existing=3)
 

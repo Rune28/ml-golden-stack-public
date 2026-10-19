@@ -49,3 +49,11 @@ def _split_long(paragraph: str, size: int, overlap: int) -> list[str]:
         return [paragraph]
     step = size - overlap
     return [paragraph[start : start + size] for start in range(0, len(paragraph) - overlap, step)]
+
+
+def distinct(chunks: list[str]) -> list[str]:
+    """Each text once, the first time it appears, in order. A file that repeats
+    itself (a document converted twice into one) would otherwise put the same
+    text into the index twice, and retrieval would spend two of its few places
+    on it. Deterministic, so a retried index writes the same chunks."""
+    return list(dict.fromkeys(chunks))

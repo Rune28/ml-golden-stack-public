@@ -27,7 +27,7 @@ When principles pull in different directions, the earlier one wins:
 
 3. **The work of a model over a dataset runs as a disposable Job; one event is processed in the worker as it comes.** Batch is a property of the work, not of a pipeline step: training, predicting over a split or re-indexing the whole corpus for a new model is a Job, while one uploaded file or one chat message is an activity against the long-running model server, because starting a pod would take longer than the work. Where a Job runs is decided by the cluster (node pools today, Kueue later), not by the service that starts it.
 
-4. **A run changes only its own results, and readers see a run once it is complete.** Then retries and late runs cannot overwrite or half-show the output of another run. This concerns data written by pipeline runs; reference data, such as uploaded files, has its own natural key.
+4. **A run changes only its own results, and readers see a run once it is complete.** Then retries and late runs cannot overwrite or half-show the output of another run. This concerns data written by pipeline runs; reference data, such as uploaded files, has its own natural key. Reference data comes from outside the platform (uploaded files, hand-written lists); what a model derives is the output of a run, even when its key is natural.
 
 5. **A step can be retried safely.** Retries happen at the activity, the pod and the Job. A step finds what an earlier attempt did and finishes it instead of doing it twice. This rests on identifiers made where a request enters the platform (be_service makes `batch_id`, `run_id`, `file_id`) and carried unchanged through the workflow, the Job and the tables, so a retry reuses them. While its inputs and outputs stay fixed, the body of a step can be rewritten freely.
 
@@ -49,11 +49,11 @@ A change does what its task asks. Bugs and improvements noticed in other code, h
 
 | Project | Checks, as in CI (.github/workflows/ci.yml) |
 |---|---|
-| be_service (Rust) | `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` |
+| be_service, chat_service (Rust) | `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` |
 | batch_worker, llm_worker, mle_models (Python) | `uv run pytest` |
 | infra | `tofu fmt -recursive -check infra`, `tofu validate`, `helm lint infra/charts/*` |
 
-`make test` runs the four test suites.
+`make test` runs the five test suites.
 
 `make` runs as the user, not root: OpenTofu state written by root cannot be updated later without it.
 

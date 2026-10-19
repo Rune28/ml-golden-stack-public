@@ -1,6 +1,6 @@
 # llm_worker
 
-Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). Today the workflow `Index` and its activity `index_file`; the chat comes next. No Kubernetes client: this worker starts no Jobs.
+Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). The workflow `Index` with its activity `index_file`, and the entity workflow `Chat` (one per conversation, a message is an Update) with `retrieve`, `generate` and `record`. No Kubernetes client: this worker starts no Jobs.
 
 `rag` is chunking with no I/O (principle 2); `workflow/llm.py` is the adapter to the model server.
 
@@ -15,6 +15,7 @@ Temporal worker of the `llm` task queue: events processed in the worker as they 
 - Language models are reached through `workflow/llm.py`: OpenAI-compatible API, server from `LLM_BASE_URL`, models from `LLM_CHAT_MODEL` and `LLM_EMBED_MODEL`. Swapping Ollama for vLLM or a managed endpoint then changes configuration, not callers.
 - Vectors of different embedding models cannot be compared: chunks carry `embed_model`, and retrieval filters by the model it embeds the question with.
 - An activity calls the server a batch at a time and heartbeats after each batch, so the worker holds one batch of vectors, not a whole file's.
+- A file's chunks are indexed once each (`rag.chunking.distinct`), and retrieval takes one text once and only chunks of files that exist (an index committed after its file was deleted stays unseen).
 
 ## Retry safety (principles 4, 5)
 

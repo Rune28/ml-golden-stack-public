@@ -7,7 +7,7 @@ OpenTofu and Helm. Local today (kind), designed for EKS or GKE next.
 | `clusters/<name>` | the cluster | its own |
 | `envs/<name>` | one environment: wires the modules onto a cluster | its own |
 | `modules/*` | one service each, cloud-agnostic | — |
-| `charts/*` | Helm charts of our applications (be-service, batch-worker, llm-worker) | — |
+| `charts/*` | Helm charts of our applications (be-service, chat-service, batch-worker, llm-worker) | — |
 
 ## Keeping the cloud move cheap (priority 4)
 

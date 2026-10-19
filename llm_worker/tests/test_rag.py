@@ -1,6 +1,6 @@
 import pytest
 
-from rag.chunking import chunk, read_text
+from rag.chunking import chunk, distinct, read_text
 
 
 def test_read_text_drops_the_bom_and_windows_newlines():
@@ -39,3 +39,7 @@ def test_empty_text_gives_no_chunks_and_overlap_must_be_smaller_than_size():
     assert chunk("  \n\n \n") == []
     with pytest.raises(ValueError):
         chunk("text", size=10, overlap=10)
+
+
+def test_distinct_keeps_the_first_of_each_text_in_order():
+    assert distinct(["a", "b", "a", "c", "b"]) == ["a", "b", "c"]

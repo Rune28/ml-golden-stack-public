@@ -24,7 +24,7 @@ endif
 
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report llm-check upload files \
+        images images-load app-status add-data train run report llm-check upload files chat chat-ui chat-ui-service \
         preflight check-owner host-setup test fmt validate
 
 help:
@@ -48,6 +48,9 @@ help:
 	@echo "llm-check        one answer and one embedding from the LLM server, from inside the cluster"
 	@echo "upload FILE=...  upload a text file for retrieval: stored, then indexed (Index workflow)"
 	@echo "files            uploaded files and the state of their index"
+	@echo "chat Q=\"...\"      a question about the files; prints CHAT=<id>, pass it to go on in that chat"
+	@echo "chat-ui          the chat page on http://127.0.0.1:9002 (a port-forward that restarts itself, Ctrl+C to stop)"
+	@echo "chat-ui-service  the same as a systemd user service: always on :9002, also after reboots"
 	@echo "test             unit tests of be_service, batch_worker, llm_worker and mle_models"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
@@ -128,7 +131,7 @@ platform-status:
 	@$(MAKE) --no-print-directory app-status
 
 app-status:
-	@for ns in seaweedfs clickhouse mlflow batch-worker llm-worker be-service; do \
+	@for ns in seaweedfs clickhouse mlflow batch-worker llm-worker be-service chat-service; do \
 	  echo "== $$ns"; $(KUBECTL) get pods,jobs -o wide -n $$ns; echo; done
 
 # The same call the Add data button makes (be_service on the kind port mapping `app`).
@@ -162,8 +165,41 @@ upload:
 files:
 	@curl -sS http://127.0.0.1:9001/api/files; echo
 
+# Without CHAT a new chat starts and its id is printed; with it the question
+# goes on in that chat, so the answer can build on the earlier ones.
+chat:
+	@test -n "$(Q)" || { echo 'usage: make chat Q="question" [CHAT=<chat_id>]'; exit 1; }
+	@chat="$(CHAT)"; \
+	if [ -z "$$chat" ]; then chat=$$(curl -sS -X POST http://127.0.0.1:9001/api/chats | jq -r .chat_id); echo "CHAT=$$chat"; fi; \
+	jq -n --arg text "$(Q)" '{text: $$text}' \
+	  | curl -sS -H 'content-type: application/json' --data-binary @- http://127.0.0.1:9001/api/chats/$$chat/messages \
+	  | jq -r 'if .error then "error: \(.error)" else "\(.text)\n\nturn \(.turn), sources: \([.sources[] | "\(.name)#\(.chunk_id)"] | join(", "))" end'
+
+# The chat product. The kind cluster maps no host port for it (a new mapping
+# means recreating the cluster), so a port-forward. It ends whenever its pod
+# is replaced, on every rollout of chat-service: the loop starts it again.
+# On a server the page is an Ingress instead (README, Infrastructure layers).
+chat-ui:
+	@echo "chat page on http://127.0.0.1:9002 (Ctrl+C to stop)"
+	@while true; do $(KUBECTL) -n chat-service port-forward svc/chat-service 9002:8080; echo "port-forward ended, starting again"; sleep 2; done
+
+# The same port-forward as a systemd user service: the page stays on :9002
+# across rollouts and reboots, and waits while the cluster is down. Then
+# make chat-ui is not needed (both would want the port).
+chat-ui-service:
+	mkdir -p ~/.config/systemd/user
+	printf '%s\n' '[Unit]' 'Description=Chat page of ml-golden-stack on 127.0.0.1:9002 (kubectl port-forward)' \
+	  '# The cluster may be down for hours: keep trying, never give up.' 'StartLimitIntervalSec=0' '' \
+	  '[Service]' 'Environment=KUBECONFIG=$(KUBECONFIG)' \
+	  'ExecStart=$(shell command -v kubectl) -n chat-service port-forward svc/chat-service 9002:8080' \
+	  '# Ends when its pod is replaced or the cluster is down: start again.' 'Restart=always' 'RestartSec=3' '' \
+	  '[Install]' 'WantedBy=default.target' > ~/.config/systemd/user/chat-ui.service
+	systemctl --user daemon-reload && systemctl --user enable --now chat-ui
+	@echo "chat page on http://127.0.0.1:9002; logs: journalctl --user -u chat-ui"
+
 test:
 	cd be_service && cargo test
+	cd chat_service && cargo test
 	cd batch_worker && uv run pytest
 	cd llm_worker && uv run pytest
 	cd mle_models && uv run pytest

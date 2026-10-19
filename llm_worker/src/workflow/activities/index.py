@@ -19,7 +19,7 @@ import clickhouse_connect
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from rag.chunking import chunk, read_text
+from rag.chunking import chunk, distinct, read_text
 from workflow.contracts import IndexInput, IndexResult
 from workflow.llm import LLM
 
@@ -57,7 +57,7 @@ class Indexer:
         name, object_key = read_file(client, input.file_id)
         raw = self.s3.get_object(Bucket=self.bucket, Key=object_key)["Body"].read()
         text = read_text(raw)
-        texts = chunk(text)
+        texts = distinct(chunk(text))
         chars = len(text)
         # The embedding below takes minutes and needs only the chunks: the
         # bytes and the whole text, two more copies of the file, go now.

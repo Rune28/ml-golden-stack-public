@@ -1,6 +1,7 @@
-//! Uploaded files: the checks they pass before anything is stored, and the
-//! object store their bytes go to. The bytes live in the bucket under
-//! `files/<file_id>`; the row in `ml_data.files` is written after them.
+//! Uploaded files: the checks they pass before anything is stored, the
+//! object store their bytes go to, and their deletion. The bytes live in the
+//! bucket under `files/<file_id>`; the row in `ml_data.files` is written
+//! after them and deleted after everything made from them.
 
 use std::time::Duration;
 
@@ -8,6 +9,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use sha2::{Digest, Sha256};
+
+use crate::store::ClickHouse;
 
 /// Upper bound of one file; the request body limit of the upload route.
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
@@ -41,6 +44,57 @@ pub fn sha256_hex(body: &[u8]) -> String {
     Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Where the bytes of a file live in the bucket.
+pub fn object_key(file_id: &str) -> String {
+    format!("files/{file_id}")
+}
+
+/// What deleting a file touches; a fake implements it in tests.
+pub trait FileParts {
+    async fn delete_index_markers(&self, file_id: &str) -> Result<()>;
+    async fn delete_chunks(&self, file_id: &str) -> Result<()>;
+    async fn delete_object(&self, key: &str) -> Result<()>;
+    async fn delete_file_row(&self, file_id: &str) -> Result<()>;
+}
+
+/// Deletes a file and everything made from it, in an order that keeps both
+/// readers and retries right. Each step deletes by file_id and is a no-op
+/// when there is nothing left, so a retry after a failure at any step
+/// finishes the job.
+pub async fn delete(parts: &impl FileParts, file_id: &str) -> Result<()> {
+    // The index markers first: retrieval sees chunks only through
+    // doc_chunks_current, which joins the run registry, so the file drops
+    // out of every answer at once.
+    parts.delete_index_markers(file_id).await?;
+    // The chunks, no longer seen by anyone.
+    parts.delete_chunks(file_id).await?;
+    parts.delete_object(&object_key(file_id)).await?;
+    // The row last: while it is there, the file is listed and a retried
+    // DELETE finds it.
+    parts.delete_file_row(file_id).await
+}
+
+/// The ClickHouse tables and the bucket of the platform, as one FileParts.
+pub struct Stores<'a> {
+    pub store: &'a ClickHouse,
+    pub objects: &'a ObjectStore,
+}
+
+impl FileParts for Stores<'_> {
+    async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
+        self.store.delete_index_markers(file_id).await
+    }
+    async fn delete_chunks(&self, file_id: &str) -> Result<()> {
+        self.store.delete_chunks(file_id).await
+    }
+    async fn delete_object(&self, key: &str) -> Result<()> {
+        self.objects.delete(key).await
+    }
+    async fn delete_file_row(&self, file_id: &str) -> Result<()> {
+        self.store.delete_file(file_id).await
+    }
+}
+
 /// S3 API of the object store (SeaweedFS locally, S3 in the cloud): requests
 /// are signed with SigV4 and sent with the same HTTP client as the rest.
 pub struct ObjectStore {
@@ -61,10 +115,19 @@ impl ObjectStore {
         self.http.put(url).body(body).send().await?.error_for_status().with_context(|| format!("PUT {key}"))?;
         Ok(())
     }
+
+    /// S3 answers 204 whether the object was there or not: deleting twice is fine.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        let url = self.bucket.delete_object(Some(&self.credentials), key).sign(Duration::from_secs(60));
+        self.http.delete(url).send().await?.error_for_status().with_context(|| format!("DELETE {key}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -81,6 +144,62 @@ mod tests {
         assert_eq!(validate("empty.txt", b""), Err("the file is empty".into()));
         assert_eq!(validate("binary.txt", &[0xff, 0xfe, 0x00]), Err("the file is not UTF-8 text".into()));
         assert!(validate("big.txt", &vec![b'a'; MAX_FILE_BYTES + 1]).unwrap_err().contains("larger"));
+    }
+
+    /// Records the steps; fails the step named in `fail` once.
+    struct FakeParts {
+        calls: RefCell<Vec<String>>,
+        fail: RefCell<Option<&'static str>>,
+    }
+
+    impl FakeParts {
+        fn new(fail: Option<&'static str>) -> Self {
+            Self { calls: RefCell::default(), fail: RefCell::new(fail) }
+        }
+        fn step(&self, name: &'static str, arg: &str) -> Result<()> {
+            if *self.fail.borrow() == Some(name) {
+                self.fail.replace(None);
+                anyhow::bail!("{name} failed");
+            }
+            self.calls.borrow_mut().push(format!("{name} {arg}"));
+            Ok(())
+        }
+    }
+
+    impl FileParts for FakeParts {
+        async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
+            self.step("markers", file_id)
+        }
+        async fn delete_chunks(&self, file_id: &str) -> Result<()> {
+            self.step("chunks", file_id)
+        }
+        async fn delete_object(&self, key: &str) -> Result<()> {
+            self.step("object", key)
+        }
+        async fn delete_file_row(&self, file_id: &str) -> Result<()> {
+            self.step("row", file_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_is_hidden_from_answers_first_and_unlisted_last() {
+        let parts = FakeParts::new(None);
+
+        delete(&parts, "abc").await.unwrap();
+
+        assert_eq!(*parts.calls.borrow(), ["markers abc", "chunks abc", "object files/abc", "row abc"]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_failed_step_finishes_the_deletion() {
+        let parts = FakeParts::new(Some("object"));
+
+        assert!(delete(&parts, "abc").await.is_err());
+        // The row is still there: the file is listed, and the retry finds it.
+        assert_eq!(*parts.calls.borrow(), ["markers abc", "chunks abc"]);
+
+        delete(&parts, "abc").await.unwrap();
+        assert_eq!(parts.calls.borrow().last().unwrap(), "row abc");
     }
 
     #[test]

@@ -1,0 +1,24 @@
+[package]
+name = "chat_service"
+version = "0.1.0"
+edition = "2024"
+description = "The chat product: a page to upload text files and ask about them, on the platform API (be_service)"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+bytes = "1"
+reqwest = { version = "0.13", features = ["query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = true

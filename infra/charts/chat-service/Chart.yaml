@@ -1,0 +1,6 @@
+apiVersion: v2
+name: chat-service
+description: "The chat product (Rust): the page to upload files and ask about them, on the platform API"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

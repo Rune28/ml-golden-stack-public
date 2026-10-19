@@ -1,13 +1,21 @@
 # Backlog
 
-## Next: LLM conveyor
+## Next: document graph
+
+Documents, authors and concepts as Data Vault hubs with links, so a question about a topic finds every document on it. Plan, decisions and slices: [docs/documents-plan.md](docs/documents-plan.md).
+
+- [ ] S5 Documents: PDF, `hub_document`, `hub_author`, activity `read_document` in `Index`
+- [ ] S6 Concepts: Job `build_concepts` over the corpus: `hub_concept`, `broader` hierarchy, aliases, `concept_ancestors`, one run per graph
+- [ ] S7 Finding documents: `route` and `find_documents` in `Chat`
+
+## Done: LLM conveyor
 
 Upload files, index them for retrieval, chat about them with a memory of the conversation. Plan, decisions and slices: [docs/llm-plan.md](docs/llm-plan.md).
 
 - [x] S1 LLM endpoint: Ollama on the host, `modules/llm-local`, the adapter in llm_worker, `make llm-check`
 - [x] S2 Files and index: `files`, `doc_chunks`, workflow `Index`, activity `index_file` in the worker
-- [ ] S3 Conversation: entity workflow `Chat` with Update, `chat_messages`
-- [ ] S4 chat_service: the page for upload and chat on the platform API
+- [x] S3 Conversation: entity workflow `Chat` with Update, `chat_messages`
+- [x] S4 chat_service: the page for upload and chat on the platform API
 
 Before S1: Ollama installed on the host (no sudo needed). 32 GB of RAM is welcome but not required (see the memory budget in the plan).
 
