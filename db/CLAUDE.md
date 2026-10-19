@@ -5,19 +5,25 @@ How principles 4–6 of the root CLAUDE.md are implemented for the tables in `ml
 ## Migrations
 
 - golang-migrate, applied by the `clickhouse-migrate` Job before the applications start. One statement per file, an `up` and a `down` per number.
-- A migration on `main` is changed by a new migration: a cluster that recorded it as done will not run it again, so an edit would silently not reach it. A migration that exists only on the working branch can be edited; the local kind cluster is disposable, and after such an edit it has to be recreated (`make platform-down && make platform-up`, ask first: it drops the data). Correcting a comment in a migration on `main` is fine: it changes no schema.
+- A migration on `main` is changed by a new migration: a cluster that recorded it as done will not run it again, so an edit would silently not reach it. A migration that exists only on the working branch can be edited; the local kind cluster is disposable, and after such an edit it has to be recreated (`make platform-down && make stores-down && make platform-up`, ask first: it drops the data). Correcting a comment in a migration on `main` is fine: it changes no schema.
 - Compatible changes (principle 6) go expand, then contract. Adding: the migration ships with or before the code that uses it. Removing or renaming: the code stops using the column first, and the migration that drops it comes in a later release. Migration 0005 is the worked example: `run_id` added with `DEFAULT report_run_id`, the old column to be dropped later.
 - The header comment of a migration says why the table or the change exists; keep that style.
 
 ## Keys of run outputs
 
-Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`, `chat_messages`):
+Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`, `chat_messages`, `sat_document`, `link_document_author`):
 
 - `run_id` is the run that wrote the rows: the unit of rewrite and of idempotency.
 - The keys of the inputs keep their name downstream as `<parent>_run_id` (`prediction_run_id`), so lineage is a join. Source data from be_service uses `batch_id`.
 - A writer deletes or rewrites rows filtered by its own `run_id`.
 
-Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. Deleting a file (be_service) removes what was made from it in reader order: index markers, chunks, the object, the row last.
+Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. Deleting a file (be_service) removes what was made from it in reader order: the markers of its runs (index, document), the document rows, the chunks, the object, the row last.
+
+## Data Vault of documents
+
+- Satellites (`sat_*`) and links (`link_*`) are outputs of runs, keyed by `run_id` like any other.
+- Hubs (`hub_document`, `hub_author`) are views of the keys of current runs, not tables: these keys are found by a model, so a key of a failed or replaced run must not stay visible (principle 4). Business keys are natural (`doi:`, `isbn:`, `file:`; `orcid:`, `name:`), so a hub keeps a stable identity without a table of its own.
+- A table-registry of keys becomes worth it once something outside the runs refers to a key; propose it then.
 
 ## Run registry and views
 

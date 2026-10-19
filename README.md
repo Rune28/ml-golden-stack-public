@@ -54,7 +54,8 @@ The decisions the stack is built on, in the order they were made. Each rule says
 | `infra/clusters/kind` | local kind cluster |
 | `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `llm-local`, `batch-worker`, `llm-worker`, `be-service`, `chat-service` |
 | `infra/charts` | Helm charts of our own applications: `batch-worker`, `llm-worker`, `be-service`, `chat-service` |
-| `infra/envs/local` | local environment: wires the modules onto the kind cluster |
+| `infra/stores/local` | data stores of the local environment: Postgres, SeaweedFS, ClickHouse; own state, so their data outlives `make platform-down` |
+| `infra/envs/local` | local environment: wires the modules onto the kind cluster and the stores |
 | `db/clickhouse/migrations` | ClickHouse schema (golang-migrate, one statement per file) |
 | `be_service` | Rust: the platform API and the MNIST page. Adds data to ClickHouse, stores uploaded files, starts workflows in Temporal (its only client) |
 | `chat_service` | Rust: the chat product. The page to upload files and ask about them, and a thin API that forwards each call to the platform API and turns its failures into messages; no Temporal, no storage |
@@ -121,30 +122,33 @@ flowchart LR
         gpun["simulated nvidia.com/gpu"]
     end
 
-    subgraph e["infra/envs/local · own state"]
-        rs["terraform_remote_state"]
-        imgs["images.auto.tfvars.json<br/>written by make platform-up"]
+    subgraph s["infra/stores/local · own state"]
+        data["postgres-local · seaweedfs-local · clickhouse-local"]
     end
 
-    subgraph m["infra/modules"]
-        direction TB
-        data["postgres-local · seaweedfs-local · clickhouse-local"]
+    subgraph e["infra/envs/local · own state"]
+        rs["terraform_remote_state<br/>cluster + stores"]
+        imgs["images.auto.tfvars.json<br/>written by make platform-up"]
         schema["postgres-database (mlflow) · clickhouse-migrate (Job)"]
         svc["temporal (official chart) · mlflow"]
-        apps["batch-worker · llm-worker · be-service<br/>own charts in infra/charts"]
+        apps["batch-worker · llm-worker · be-service · chat-service<br/>own charts in infra/charts"]
     end
 
     kindc --> gpun
+    kindc -- "endpoint, certificates" --> data
     kindc -- "endpoint, certificates" --> rs
-    rs --> data --> schema --> svc --> apps
+    data -- "hosts, passwords" --> rs
+    rs --> schema --> svc --> apps
     imgs --> apps
 ```
 
-`clusters/*` and `envs/*` are separate OpenTofu root modules with separate state. An environment can be applied and destroyed without touching its cluster.
+`clusters/*`, `stores/*` and `envs/*` are separate OpenTofu root modules with separate state, all built from `infra/modules`. An environment can be applied and destroyed without touching its stores, and both without touching the cluster.
+
+The stores are a layer of their own because their lifetime differs from a release: in the cloud they are managed services, created once and kept, while the services and applications above them are installed and removed freely. Locally this means `make platform-down` leaves Postgres, SeaweedFS and ClickHouse with their volumes and passwords, and the next `make platform-up` finds the data where it was: Temporal's schema job, the MLflow database job and the ClickHouse migrations all skip what is already there. Only `make stores-down` deletes the data. `make infra-down` deletes it too: the volumes live inside the kind nodes.
 
 Everything cloud specific lives in `clusters/<name>` and `envs/<name>`:
 
-| | kind (`envs/local`) | EKS / GKE (planned) |
+| | kind (`stores/local`, `envs/local`) | EKS / GKE (planned) |
 |---|---|---|
 | Cluster state | local file | S3 / GCS |
 | Provider auth | client certificate | `aws eks get-token` / Google access token |
@@ -156,7 +160,7 @@ Everything cloud specific lives in `clusters/<name>` and `envs/<name>`:
 | History shards | 4 | 512 |
 | GPU | simulated: fake `nvidia.com/gpu` on the `gpu` pool | real GPU node group; EKS: NVIDIA device plugin, GKE: built in |
 
-Moving to a cloud means adding `clusters/eks` and `envs/eks` (or `gke`); `modules/*` stay as they are.
+Moving to a cloud means adding `clusters/eks`, `stores/eks` and `envs/eks` (or `gke`); `modules/*` stay as they are. `stores/eks` creates the managed services and gives the same outputs as `stores/local`.
 
 ### Cluster contract
 
@@ -221,16 +225,17 @@ make host-setup
 
 ```bash
 make infra-up          # create the cluster
-make platform-up       # build and load the images, install platform services and applications
+make platform-up       # install the data stores, build and load the images, install platform services and applications
 export KUBECONFIG=$PWD/infra/clusters/kind/.kubeconfig
 make infra-status      # nodes, pools, taints, GPUs
 make platform-status   # all pods and pipeline Jobs
 
-make platform-down     # always before infra-down
-make infra-down
+make platform-down     # services and applications; the data stays
+make stores-down       # the data stores with all their data
+make infra-down        # after both
 ```
 
-`make platform-up` is the one command for everything above the cluster. It builds the three application images, tags them by content (`dev-<image id>`), loads into the kind nodes only what they miss, and applies `infra/envs/local`. A changed image gets a new tag and its pods roll; with nothing changed the apply is a no-op. `make platform-up IMAGES=remote TAG=sha-abc1234` takes the images CI published to GHCR instead.
+`make platform-up` is the one command for everything above the cluster. It applies `infra/stores/local` first (a no-op when the stores are there), then builds the three application images, tags them by content (`dev-<image id>`), loads into the kind nodes only what they miss, and applies `infra/envs/local`. A changed image gets a new tag and its pods roll; with nothing changed the apply is a no-op. `make platform-up IMAGES=remote TAG=sha-abc1234` takes the images CI published to GHCR instead.
 
 Do not run `make` with sudo: OpenTofu state written by root cannot be updated later without it. `make` refuses to run as root, and every target that runs OpenTofu first checks (`make check-owner`) that its files belong to you, printing the `chown` that fixes them. If docker needs sudo, give your user access to docker instead (`make preflight` says how).
 
@@ -371,7 +376,7 @@ The models are variables of `envs/local` (`llm_chat_model`, `llm_embed_model`): 
 
 All platform pods are pinned to `node-pool=cpu`. Local Postgres has no replication and no backups. Its password is generated by OpenTofu, stored in the state and in the `postgres` and `temporal-db` Secrets.
 
-`numHistoryShards` is 4 locally and cannot be changed after the first install without recreating the database (`make platform-down && make platform-up`).
+`numHistoryShards` is 4 locally and cannot be changed after the first install without recreating the database (`make platform-down && make stores-down && make platform-up`).
 
 For a quick check from the host:
 

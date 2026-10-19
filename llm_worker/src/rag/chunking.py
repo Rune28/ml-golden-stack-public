@@ -4,7 +4,10 @@ they fit, packed together up to `size` characters, and a short paragraph at
 the end of a chunk is repeated at the start of the next one, so a question
 about the boundary still finds both sides."""
 
+import io
 import re
+
+from pypdf import PdfReader
 
 SIZE = 1000
 OVERLAP = 200
@@ -13,8 +16,13 @@ _PARAGRAPHS = re.compile(r"\n\s*\n")
 
 
 def read_text(raw: bytes) -> str:
-    """UTF-8 text with Unix newlines; a byte-order mark is dropped."""
-    text = raw.decode("utf-8-sig", errors="replace")
+    """Text with Unix newlines. A PDF is read from its text layer, a page a
+    paragraph at least (a scan has no text layer and reads as nothing); any
+    other file is UTF-8, a byte-order mark dropped."""
+    if raw.startswith(b"%PDF-"):
+        text = "\n\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(raw)).pages)
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 

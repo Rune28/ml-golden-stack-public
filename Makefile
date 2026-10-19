@@ -1,6 +1,7 @@
 TOFU        ?= tofu
 DOCKER      ?= docker
 CLUSTER_DIR := infra/clusters/kind
+STORES_DIR  := infra/stores/local
 ENV_DIR     := infra/envs/local
 KUBECONFIG  := $(abspath $(CLUSTER_DIR)/.kubeconfig)
 KUBECTL     := KUBECONFIG=$(KUBECONFIG) kubectl
@@ -23,20 +24,24 @@ $(error do not run make as root: OpenTofu state written by root cannot be update
 endif
 
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
+        stores-init stores-plan stores-up stores-down \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report llm-check upload files chat chat-ui chat-ui-service \
+        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat chat-ui chat-ui-service \
         preflight check-owner host-setup test fmt validate
 
 help:
 	@echo "preflight        check the host (tools, inotify limits, memory)"
 	@echo "host-setup       raise inotify limits for kind, persistently (Linux, uses sudo)"
 	@echo "infra-up         create the local kind cluster (runs preflight first)"
-	@echo "infra-down       destroy the local kind cluster (run platform-down first)"
+	@echo "infra-down       destroy the local kind cluster (run platform-down and stores-down first)"
 	@echo "infra-status     show nodes, pools, taints and GPUs"
 	@echo "infra-plan       show planned changes to the cluster"
-	@echo "platform-up      build and load the images, install platform services and applications"
+	@echo "stores-up        install the data stores: Postgres, SeaweedFS, ClickHouse (platform-up runs it)"
+	@echo "stores-down      delete the data stores WITH ALL DATA"
+	@echo "stores-plan      show planned changes to the data stores"
+	@echo "platform-up      install the data stores, build and load the images, install platform services and applications"
 	@echo "                 (IMAGES=remote TAG=sha-abc1234 takes the images from GHCR instead)"
-	@echo "platform-down    uninstall platform services and applications"
+	@echo "platform-down    uninstall platform services and applications; the data stores and their data stay"
 	@echo "platform-status  show platform and application pods"
 	@echo "platform-plan    show planned changes to platform services and applications"
 	@echo "images           build the application images and pin their tags for platform-up"
@@ -46,8 +51,10 @@ help:
 	@echo "run MODEL=champion  start the Run workflow"
 	@echo "report           start the Report workflow on the latest prediction run"
 	@echo "llm-check        one answer and one embedding from the LLM server, from inside the cluster"
-	@echo "upload FILE=...  upload a text file for retrieval: stored, then indexed (Index workflow)"
+	@echo "upload FILE=...  upload a text or PDF file for retrieval: stored, then indexed (Index workflow)"
 	@echo "files            uploaded files and the state of their index"
+	@echo "documents        documents read from the files: title, authors, year, keywords"
+	@echo "reindex-all      every uploaded file through Index again (after new Index steps)"
 	@echo "chat Q=\"...\"      a question about the files; prints CHAT=<id>, pass it to go on in that chat"
 	@echo "chat-ui          the chat page on http://127.0.0.1:9002 (a port-forward that restarts itself, Ctrl+C to stop)"
 	@echo "chat-ui-service  the same as a systemd user service: always on :9002, also after reboots"
@@ -67,10 +74,10 @@ preflight:
 # An earlier sudo make leaves state and .terraform owned by root, and init
 # fails with "permission denied". Found before anything runs, with the fix.
 check-owner:
-	@others=$$(find $(CLUSTER_DIR) $(ENV_DIR) ! -user "$$(id -un)" -print 2>/dev/null | head -5); \
+	@others=$$(find $(CLUSTER_DIR) $(STORES_DIR) $(ENV_DIR) ! -user "$$(id -un)" -print 2>/dev/null | head -5); \
 	if [ -n "$$others" ]; then \
 	  echo "OpenTofu files owned by another user (an earlier sudo make?):"; echo "$$others" | sed 's/^/  /'; \
-	  echo "fix once: sudo chown -R $$(id -un): $(CLUSTER_DIR) $(ENV_DIR)"; exit 1; \
+	  echo "fix once: sudo chown -R $$(id -un): $(CLUSTER_DIR) $(STORES_DIR) $(ENV_DIR)"; exit 1; \
 	fi
 
 # The only target that changes the host. Kept out of infra-up on purpose:
@@ -106,16 +113,31 @@ images-load:
 	DOCKER=$(DOCKER) scripts/images.sh load
 endif
 
+# The data stores have their own state, so platform-down leaves them and
+# their data; only stores-down deletes them.
+stores-init: check-owner
+	$(TOFU) -chdir=$(STORES_DIR) init
+
+stores-plan: stores-init
+	$(TOFU) -chdir=$(STORES_DIR) plan
+
+stores-up: stores-init
+	$(TOFU) -chdir=$(STORES_DIR) apply -auto-approve
+
+stores-down: check-owner
+	$(TOFU) -chdir=$(STORES_DIR) destroy -auto-approve
+
 platform-init: check-owner
 	$(TOFU) -chdir=$(ENV_DIR) init
 
 platform-plan: platform-init
 	$(TOFU) -chdir=$(ENV_DIR) plan
 
-# Images first: the applications are part of the platform apply, and the
-# image tags come from images.auto.tfvars.json. check-owner before the
-# minutes of image builds, not after them.
-platform-up: check-owner images images-load platform-init
+# Stores first: the platform reads their state. Then images: the applications
+# are part of the platform apply, and the image tags come from
+# images.auto.tfvars.json. check-owner before the minutes of image builds,
+# not after them.
+platform-up: check-owner stores-up images images-load platform-init
 	$(TOFU) -chdir=$(ENV_DIR) apply -auto-approve
 	@echo
 	@$(TOFU) -chdir=$(ENV_DIR) output
@@ -164,6 +186,18 @@ upload:
 
 files:
 	@curl -sS http://127.0.0.1:9001/api/files; echo
+
+# Documents read from the files: a preprint and the published version of a
+# paper are one document with two files.
+documents:
+	@curl -sS http://127.0.0.1:9001/api/documents; echo
+
+# Every uploaded file through Index again, one by one: chunks, and the steps
+# added to Index since the file came (the document read from it).
+reindex-all:
+	@curl -sS http://127.0.0.1:9001/api/files | jq -r '.[].file_id' | while read -r id; do \
+	  curl -sS -X POST http://127.0.0.1:9001/api/files/$$id/index; echo; \
+	done
 
 # Without CHAT a new chat starts and its id is printed; with it the question
 # goes on in that chat, so the answer can build on the earlier ones.

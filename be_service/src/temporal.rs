@@ -13,7 +13,7 @@ use temporalio_client::errors::{
     WorkflowGetResultError, WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError,
 };
 use temporalio_client::{
-    Client, ClientOptions, ConnectionOptions, UntypedUpdate, UntypedWorkflow, Url, WorkflowDescribeOptions,
+    Client, ClientOptions, ConnectionOptions, RpcOptions, UntypedUpdate, UntypedWorkflow, Url, WorkflowDescribeOptions,
     WorkflowExecutionStatus, WorkflowGetResultOptions, WorkflowIdConflictPolicy, WorkflowStartOptions,
     WorkflowUpdateWithStartOptions,
 };
@@ -26,6 +26,14 @@ use tokio::sync::OnceCell;
 pub const BATCH_QUEUE: &str = "batch";
 /// llm_worker: events processed in the worker against the LLM server: Index, Chat.
 pub const LLM_QUEUE: &str = "llm";
+
+/// The client waits for an answer by polling: each poll is a long poll the
+/// server holds for about a minute, and the client gives it 70 seconds by
+/// default. A server slow to answer one poll (a host swapping) ended the
+/// wait with "Timeout expired" while the answer was still being written;
+/// the client does not retry that. A wider deadline per poll keeps the wait
+/// going; the whole wait is bounded by the caller (the chat page, 6 minutes).
+const UPDATE_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One button, one fixed workflow ID: a second press while the first run is
 /// in progress is refused by Temporal instead of starting a parallel run.
@@ -149,6 +157,7 @@ impl Temporal {
             WorkflowIdConflictPolicy::UseExisting,
         )
         .update_id(run_id)
+        .rpc_options(RpcOptions::builder().timeout(UPDATE_POLL_TIMEOUT).build())
         .build();
         let input = serde_json::json!({ "chat_id": chat_id });
         let message = serde_json::json!({ "text": text, "run_id": run_id });

@@ -9,24 +9,53 @@ from temporalio.worker import Worker
 from workflow import ChatWorkflow
 from workflow.chat import HISTORY
 from workflow.contracts import (
+    Broad,
     ChatInput,
     ChatMessage,
+    Gathered,
+    GatherInput,
     Generated,
     GenerateInput,
     MessageInput,
     RecordInput,
     RetrieveInput,
+    Route,
+    RouteInput,
     Source,
+    SummarizeInput,
 )
 
 SOURCE = Source(file_id="file-1", index_run_id="idx-1", chunk_id=3, name="notes.md", distance=0.2)
 
 
+TOPIC = [Source(file_id="file-1", index_run_id="idx-1", chunk_id=n, name="book.txt") for n in (7, 9)]
+
+
 class FakeSteps:
-    """Stands in for retrieve, generate and record: records calls, answers "answer <n>"."""
+    """Stands in for the steps of an answer: records calls, answers "answer <n>".
+    `route` and `gathered` set what a topic message gets; by default every
+    message is about a fact."""
 
     def __init__(self):
         self.calls = []
+        self.route_to = Route(kind="fact")
+        self.gathered = Gathered(mode="chunks", terms=["смерть"], found=2, sources=TOPIC)
+        self.summary = "summary of {n} chunks"
+
+    @activity.defn(name="route")
+    async def route(self, input: RouteInput) -> Route:
+        self.calls.append(("route", input))
+        return self.route_to
+
+    @activity.defn(name="gather")
+    async def gather(self, input: GatherInput) -> Gathered:
+        self.calls.append(("gather", input))
+        return self.gathered
+
+    @activity.defn(name="summarize")
+    async def summarize(self, input: SummarizeInput) -> Generated:
+        self.calls.append(("summarize", input))
+        return Generated(text=self.summary.format(n=len(input.sources)), model="qwen3:4b")
 
     @activity.defn(name="retrieve")
     async def retrieve(self, input: RetrieveInput) -> list[Source]:
@@ -71,7 +100,8 @@ async def chat(env):
         return handle, send
 
     async with Worker(env.client, task_queue=queue, workflows=[ChatWorkflow],
-                      activities=[steps.retrieve, steps.generate, steps.record]):
+                      activities=[steps.retrieve, steps.generate, steps.record,
+                                  steps.route, steps.gather, steps.summarize]):
         yield steps, start
 
 
@@ -81,7 +111,7 @@ async def test_a_message_is_retrieved_generated_and_recorded_in_order(chat):
 
     answer = await send("what is S3?", run_id="ans-1")
 
-    assert [name for name, _ in steps.calls] == ["retrieve", "generate", "record"]
+    assert [name for name, _ in steps.calls] == ["route", "retrieve", "generate", "record"]
     assert steps.of("generate")[0].sources == [SOURCE]
     [record] = steps.of("record")
     assert (record.run_id, record.turn, record.question, record.answer) == ("ans-1", 1, "what is S3?", "answer to what is S3?")
@@ -136,3 +166,56 @@ async def test_an_empty_message_is_rejected_before_any_step(chat):
         await send("   ")
 
     assert steps.calls == []
+
+
+async def test_a_topic_is_gathered_from_its_chunks_and_summarized(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["смерти"])
+    _, send = await start()
+
+    answer = await send("что там говорится о смерти?", run_id="ans-1")
+
+    assert [name for name, _ in steps.calls] == ["route", "gather", "summarize", "record"]
+    assert steps.of("gather")[0].terms == ["смерти"]
+    assert steps.of("summarize")[0].sources == TOPIC
+    [record] = steps.of("record")
+    assert (record.answer, record.sources) == ("summary of 2 chunks", TOPIC)
+    assert (answer.text, answer.sources) == ("summary of 2 chunks", TOPIC)
+
+
+async def test_a_topic_too_broad_is_answered_without_reading_anything(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["Пруст"])
+    steps.gathered = Gathered(mode="too_broad", terms=["пруст"],
+                              broad=[Broad(term="пруст", file_id="file-1", name="Топология пути", chunks=1064)])
+    _, send = await start()
+
+    answer = await send("что имел в виду Пруст?")
+
+    assert [name for name, _ in steps.calls] == ["route", "gather", "record"]
+    assert "слишком широкая" in answer.text and "~1064" in answer.text
+    assert answer.sources == []
+
+
+async def test_a_topic_whose_words_name_nothing_stored_is_answered_as_a_fact(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["квазары"])
+    steps.gathered = Gathered(mode="none", terms=["квазар"])
+    _, send = await start()
+
+    answer = await send("что там о квазарах?")
+
+    assert [name for name, _ in steps.calls] == ["route", "gather", "retrieve", "generate", "record"]
+    assert answer.sources == [SOURCE]
+
+
+async def test_chunks_of_a_topic_that_say_nothing_about_the_question_leave_it_to_a_fact(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["смерти"])
+    steps.summary = ""
+    _, send = await start()
+
+    answer = await send("что там о смерти бабочек?")
+
+    assert [name for name, _ in steps.calls] == ["route", "gather", "summarize", "retrieve", "generate", "record"]
+    assert answer.sources == [SOURCE]

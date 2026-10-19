@@ -4,6 +4,12 @@ variable "cluster_state_path" {
   default     = "../../clusters/kind/terraform.tfstate"
 }
 
+variable "stores_state_path" {
+  description = "State file of the data stores layer."
+  type        = string
+  default     = "../../stores/local/terraform.tfstate"
+}
+
 variable "images" {
   description = <<-EOT
     Images of the applications, repository:tag. `make platform-up` writes

@@ -156,6 +156,21 @@ pub struct FileRow {
     pub embed_model: String,
 }
 
+/// A document with the files it came in. Its fields are those of its latest
+/// document run, when it came in several files.
+#[derive(Serialize, Deserialize, Row, Debug)]
+pub struct DocumentRow {
+    pub document_id: String,
+    pub title: String,
+    pub year: Option<u16>,
+    pub kind: String,
+    pub keywords: Vec<String>,
+    pub authors: Vec<String>,
+    pub files: Vec<String>,
+    /// The top themes of the file the fields come from, by rank.
+    pub themes: Vec<String>,
+}
+
 /// `uploaded_at` is left to its DEFAULT now64().
 #[derive(Serialize, Row)]
 struct FileInsert<'a> {
@@ -271,14 +286,24 @@ impl ClickHouse {
         Ok(())
     }
 
-    /// The index markers of a file, of every run and model: its chunks
-    /// drop out of doc_chunks_current at once.
-    pub async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
+    /// The markers of the runs made from a file, of every run and model: its
+    /// chunks, its document and its keywords drop out of the current views
+    /// at once.
+    pub async fn delete_markers(&self, file_id: &str) -> Result<()> {
         self.client
-            .query("DELETE FROM runs WHERE kind = 'index' AND parents['file_id'] = ?")
+            .query("DELETE FROM runs WHERE kind IN ('index', 'document', 'mentions') AND parents['file_id'] = ?")
             .bind(file_id)
             .execute()
             .await?;
+        Ok(())
+    }
+
+    /// What runs other than the index made from a file: the document and its
+    /// authors, the keywords of its chunks and its themes.
+    pub async fn delete_derived(&self, file_id: &str) -> Result<()> {
+        for table in ["sat_document", "link_document_author", "chunk_mentions", "document_themes"] {
+            self.client.query(&format!("DELETE FROM {table} WHERE file_id = ?")).bind(file_id).execute().await?;
+        }
         Ok(())
     }
 
@@ -347,6 +372,34 @@ impl ClickHouse {
                  FROM runs FINAL WHERE kind = 'index' GROUP BY file_id) AS r ON r.file_id = f.file_id \
                  ORDER BY f.uploaded_at DESC LIMIT ?",
             )
+            .bind(limit)
+            .fetch_all()
+            .await?)
+    }
+
+    /// Documents, the latest read first. Through the views of current runs
+    /// (README, rule 11): a run halfway or of a deleted file never shows.
+    pub async fn documents(&self, limit: u64, top_themes: u32) -> Result<Vec<DocumentRow>> {
+        Ok(self
+            .client
+            .query(
+                "SELECT d.document_id AS document_id, d.title AS title, d.year AS year, d.kind AS kind, \
+                 d.keywords AS keywords, a.authors AS authors, d.files AS files, t.themes AS themes FROM ( \
+                   SELECT s.document_id AS document_id, argMax(s.run_id, r.started_at) AS run_id, \
+                   argMax(s.file_id, r.started_at) AS file_id, \
+                   argMax(s.title, r.started_at) AS title, argMax(s.year, r.started_at) AS year, \
+                   argMax(s.kind, r.started_at) AS kind, argMax(s.keywords, r.started_at) AS keywords, \
+                   groupUniqArray(s.file_id) AS files, max(r.started_at) AS read_at \
+                   FROM sat_document_current AS s \
+                   INNER JOIN (SELECT run_id, started_at FROM runs FINAL WHERE kind = 'document') AS r \
+                   ON r.run_id = s.run_id GROUP BY s.document_id) AS d \
+                 LEFT JOIN (SELECT run_id, arrayMap(p -> p.2, arraySort(groupArray((position, name)))) AS authors \
+                   FROM link_document_author_current GROUP BY run_id) AS a ON a.run_id = d.run_id \
+                 LEFT JOIN (SELECT file_id, arrayMap(p -> p.2, arraySort(groupArray((rank, term)))) AS themes \
+                   FROM document_themes_current WHERE rank <= ? GROUP BY file_id) AS t ON t.file_id = d.file_id \
+                 ORDER BY d.read_at DESC LIMIT ?",
+            )
+            .bind(top_themes)
             .bind(limit)
             .fetch_all()
             .await?)

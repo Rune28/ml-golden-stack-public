@@ -77,3 +77,37 @@ def test_server_errors_carry_the_status_and_the_reason(server):
     server(error=urllib.error.URLError("Connection refused"))
     with pytest.raises(LLMError, match="unreachable: Connection refused"):
         LLM_.embed(["a"])
+
+
+def test_a_schema_asks_for_structured_output_and_thinking_can_be_turned_off(server):
+    fake = server(answer={"choices": [{"message": {"content": '{"title": "Squats"}'}}]})
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+
+    answer = LLM_.chat_json([{"role": "user", "content": "read"}], schema)
+
+    body = fake.requests[0][1]
+    assert body["response_format"] == {"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}
+    assert body["reasoning_effort"] == "none"
+    assert answer == {"title": "Squats"}
+
+
+def test_a_plain_chat_thinks_and_has_no_schema(server):
+    fake = server(answer={"choices": [{"message": {"content": "ok"}}]})
+
+    LLM_.chat([{"role": "user", "content": "hi"}])
+
+    assert "response_format" not in fake.requests[0][1] and "reasoning_effort" not in fake.requests[0][1]
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]"])
+def test_chat_json_rejects_an_answer_that_is_not_an_object(server, content):
+    server(answer={"choices": [{"message": {"content": content}}]})
+
+    with pytest.raises(LLMError, match="not a JSON object|not JSON"):
+        LLM_.chat_json([{"role": "user", "content": "read"}], {"type": "object"})
+
+
+def test_thinking_written_into_the_answer_is_cut_off(server):
+    server(answer={"choices": [{"message": {"content": "Хорошо, мне нужно...\n</think>\n\n[25]: смерть"}}]})
+
+    assert LLM_.chat([{"role": "user", "content": "notes"}], think=False).text == "[25]: смерть"

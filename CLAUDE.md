@@ -57,4 +57,4 @@ A change does what its task asks. Bugs and improvements noticed in other code, h
 
 `make` runs as the user, not root: OpenTofu state written by root cannot be updated later without it.
 
-Ask before commands that destroy state or data: `make platform-down`, `make infra-down`, `tofu destroy`, deleting namespaces, PVCs or ClickHouse rows by hand.
+Ask before commands that destroy state or data: `make stores-down`, `make infra-down`, `make platform-down`, `tofu destroy`, deleting namespaces, PVCs or ClickHouse rows by hand.

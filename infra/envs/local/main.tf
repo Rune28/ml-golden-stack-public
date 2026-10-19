@@ -6,41 +6,21 @@ locals {
   platform_node_selector = { "node-pool" = "cpu" }
 }
 
-# In the cloud this is a managed database (RDS, Cloud SQL) instead.
-module "postgres" {
-  source = "../../modules/postgres-local"
-
-  node_selector = local.platform_node_selector
-}
-
-# In the cloud this is S3 / GCS instead. `mlflow` holds model artifacts,
-# `pipeline` holds the MNIST cache and results of pipeline Jobs.
-module "seaweedfs" {
-  source = "../../modules/seaweedfs-local"
-
-  buckets       = ["mlflow", "pipeline"]
-  node_selector = local.platform_node_selector
-}
-
-# In the cloud this is a managed ClickHouse instead. Holds the pipeline data
-# (database ml_data); its schema comes from db/clickhouse/migrations.
-module "clickhouse" {
-  source = "../../modules/clickhouse-local"
-
-  node_selector = local.platform_node_selector
-}
+# Postgres, SeaweedFS and ClickHouse are in infra/stores/local, with their
+# own state: destroying this layer leaves their data. They come in as
+# local.stores (versions.tf), the connection data of managed services.
 
 module "clickhouse_migrate" {
   source = "../../modules/clickhouse-migrate"
 
-  namespace      = module.clickhouse.namespace
+  namespace      = local.stores.clickhouse.namespace
   migrations_dir = "${path.root}/../../../db/clickhouse/migrations"
   clickhouse = {
-    host        = module.clickhouse.host
-    native_port = module.clickhouse.native_port
-    user        = module.clickhouse.user
+    host        = local.stores.clickhouse.host
+    native_port = local.stores.clickhouse.native_port
+    user        = local.stores.clickhouse.user
   }
-  clickhouse_password = module.clickhouse.password
+  clickhouse_password = local.stores.clickhouse_password
   node_selector       = local.platform_node_selector
 }
 
@@ -50,13 +30,13 @@ module "mlflow_db" {
   source = "../../modules/postgres-database"
 
   name      = "mlflow"
-  namespace = module.postgres.namespace
+  namespace = local.stores.postgres.namespace
   postgres = {
-    host = module.postgres.host
-    port = module.postgres.port
-    user = module.postgres.user
+    host = local.stores.postgres.host
+    port = local.stores.postgres.port
+    user = local.stores.postgres.user
   }
-  postgres_password = module.postgres.password
+  postgres_password = local.stores.postgres_password
   node_selector     = local.platform_node_selector
 }
 
@@ -72,11 +52,11 @@ module "mlflow" {
   db_password = module.mlflow_db.password
 
   s3 = {
-    endpoint   = module.seaweedfs.endpoint
+    endpoint   = local.stores.seaweedfs.endpoint
     bucket     = "mlflow"
-    access_key = module.seaweedfs.access_key
+    access_key = local.stores.seaweedfs.access_key
   }
-  s3_secret_key = module.seaweedfs.secret_key
+  s3_secret_key = local.stores.seaweedfs_secret_key
 
   # Exposed on the host through the kind port mapping `mlflow`.
   service = {
@@ -90,11 +70,11 @@ module "temporal" {
   source = "../../modules/temporal"
 
   db = {
-    host = module.postgres.host
-    port = module.postgres.port
-    user = module.postgres.user
+    host = local.stores.postgres.host
+    port = local.stores.postgres.port
+    user = local.stores.postgres.user
   }
-  db_password = module.postgres.password
+  db_password = local.stores.postgres_password
 
   # Small to keep the footprint low; cannot be changed later without
   # recreating the database.
@@ -125,18 +105,18 @@ module "batch_worker" {
   temporal_address = module.temporal.frontend_address
 
   clickhouse = {
-    host      = module.clickhouse.host
-    http_port = module.clickhouse.http_port
-    user      = module.clickhouse.user
+    host      = local.stores.clickhouse.host
+    http_port = local.stores.clickhouse.http_port
+    user      = local.stores.clickhouse.user
   }
-  clickhouse_password = module.clickhouse.password
+  clickhouse_password = local.stores.clickhouse_password
 
   s3 = {
-    endpoint   = module.seaweedfs.endpoint
+    endpoint   = local.stores.seaweedfs.endpoint
     bucket     = "pipeline"
-    access_key = module.seaweedfs.access_key
+    access_key = local.stores.seaweedfs.access_key
   }
-  s3_secret_key       = module.seaweedfs.secret_key
+  s3_secret_key       = local.stores.seaweedfs_secret_key
   mlflow_tracking_uri = module.mlflow.tracking_uri
   node_selector       = local.platform_node_selector
 
@@ -150,19 +130,19 @@ module "llm_worker" {
   temporal_address = module.temporal.frontend_address
 
   clickhouse = {
-    host      = module.clickhouse.host
-    http_port = module.clickhouse.http_port
-    user      = module.clickhouse.user
+    host      = local.stores.clickhouse.host
+    http_port = local.stores.clickhouse.http_port
+    user      = local.stores.clickhouse.user
   }
-  clickhouse_password = module.clickhouse.password
+  clickhouse_password = local.stores.clickhouse_password
 
   # Uploaded files, written there by be_service.
   s3 = {
-    endpoint   = module.seaweedfs.endpoint
+    endpoint   = local.stores.seaweedfs.endpoint
     bucket     = "pipeline"
-    access_key = module.seaweedfs.access_key
+    access_key = local.stores.seaweedfs.access_key
   }
-  s3_secret_key = module.seaweedfs.secret_key
+  s3_secret_key = local.stores.seaweedfs_secret_key
   node_selector = local.platform_node_selector
 
   llm = {
@@ -181,20 +161,20 @@ module "be_service" {
   temporal_address = module.temporal.frontend_address
 
   clickhouse = {
-    host      = module.clickhouse.host
-    http_port = module.clickhouse.http_port
-    user      = module.clickhouse.user
+    host      = local.stores.clickhouse.host
+    http_port = local.stores.clickhouse.http_port
+    user      = local.stores.clickhouse.user
   }
-  clickhouse_password = module.clickhouse.password
+  clickhouse_password = local.stores.clickhouse_password
   mlflow_tracking_uri = module.mlflow.tracking_uri
 
   # Uploaded files, next to the results of pipeline Jobs.
   s3 = {
-    endpoint   = module.seaweedfs.endpoint
+    endpoint   = local.stores.seaweedfs.endpoint
     bucket     = "pipeline"
-    access_key = module.seaweedfs.access_key
+    access_key = local.stores.seaweedfs.access_key
   }
-  s3_secret_key = module.seaweedfs.secret_key
+  s3_secret_key = local.stores.seaweedfs_secret_key
 
   # Exposed on the host through the kind port mapping `app`.
   service = {

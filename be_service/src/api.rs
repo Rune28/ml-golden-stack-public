@@ -18,7 +18,8 @@ use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
 use crate::store::{
-    Batch, ChatSummary, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats, StoredFile,
+    Batch, ChatSummary, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, DocumentRow, PredictionRun, Stats,
+    StoredFile,
 };
 use crate::temporal::{LLM_QUEUE, Pipeline, StartError, Started, Status, Temporal, UpdateError};
 
@@ -53,6 +54,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/files", post(upload_file).layer(DefaultBodyLimit::max(files::MAX_FILE_BYTES)).get(list_files))
         .route("/api/files/{file_id}", delete(delete_file))
         .route("/api/files/{file_id}/index", post(index_file))
+        .route("/api/documents", get(list_documents))
         .route("/api/chats", post(new_chat).get(list_chats))
         .route("/api/chats/{chat_id}/messages", post(send_message).get(chat_history))
         .route("/healthz", get(|| async { "ok" }))
@@ -255,9 +257,16 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(file_id): Path<Str
 }
 
 /// One Index workflow per file at a time (`index-<file_id>`); the run_id
-/// names the Job and the chunks it writes.
+/// names the chunks it writes, the document_run_id the document read from
+/// the file, the mentions_run_id the keywords of its chunks. All are made
+/// here, where the request enters the platform.
 async fn start_index(state: &AppState, file_id: &str) -> Result<Started, ApiError> {
-    let input = json!({ "file_id": file_id, "run_id": uuid::Uuid::now_v7().to_string() });
+    let input = json!({
+        "file_id": file_id,
+        "run_id": uuid::Uuid::now_v7().to_string(),
+        "document_run_id": uuid::Uuid::now_v7().to_string(),
+        "mentions_run_id": uuid::Uuid::now_v7().to_string(),
+    });
     match state.temporal.start_workflow(LLM_QUEUE, "Index", &format!("index-{file_id}"), input).await {
         Ok(started) => Ok(started),
         Err(StartError::AlreadyRunning) => Err(ApiError::Conflict(format!("file {file_id} is already being indexed"))),
@@ -311,6 +320,27 @@ async fn list_files(State(state): State<Arc<AppState>>) -> Result<Json<Vec<FileV
         });
     }
     Ok(Json(views))
+}
+
+#[derive(Deserialize)]
+struct DocumentsQuery {
+    /// Themes per document: every theme is stored with its rank, the top
+    /// is chosen here.
+    #[serde(default = "default_top_themes")]
+    top: u32,
+}
+
+fn default_top_themes() -> u32 {
+    15
+}
+
+/// Documents read from the uploaded files: a preprint and the published
+/// version of a paper are one document with two files.
+async fn list_documents(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DocumentsQuery>,
+) -> Result<Json<Vec<DocumentRow>>, ApiError> {
+    Ok(Json(state.store.documents(100, q.top.min(100)).await?))
 }
 
 #[derive(Serialize)]

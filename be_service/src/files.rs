@@ -14,7 +14,7 @@ use crate::store::ClickHouse;
 
 /// Upper bound of one file; the request body limit of the upload route.
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
-const EXTENSIONS: [&str; 3] = ["txt", "md", "markdown"];
+const EXTENSIONS: [&str; 4] = ["txt", "md", "markdown", "pdf"];
 
 /// Why a file is refused, before it is stored.
 pub fn validate(name: &str, body: &[u8]) -> Result<(), String> {
@@ -23,9 +23,9 @@ pub fn validate(name: &str, body: &[u8]) -> Result<(), String> {
     if !well_formed {
         return Err("name: 1-200 characters, no slashes".into());
     }
-    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase());
-    if !extension.is_some_and(|ext| EXTENSIONS.contains(&ext.as_str())) {
-        return Err(format!("only text files for now: .{}", EXTENSIONS.join(", .")));
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    if !EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!("only text and PDF files for now: .{}", EXTENSIONS.join(", .")));
     }
     if body.is_empty() {
         return Err("the file is empty".into());
@@ -33,7 +33,12 @@ pub fn validate(name: &str, body: &[u8]) -> Result<(), String> {
     if body.len() > MAX_FILE_BYTES {
         return Err(format!("the file is larger than {} MiB", MAX_FILE_BYTES / 1024 / 1024));
     }
-    if std::str::from_utf8(body).is_err() {
+    // The worker reads a PDF by its signature, any other file as UTF-8 text.
+    if extension == "pdf" {
+        if !body.starts_with(b"%PDF-") {
+            return Err("the file is not a PDF".into());
+        }
+    } else if std::str::from_utf8(body).is_err() {
         return Err("the file is not UTF-8 text".into());
     }
     Ok(())
@@ -51,7 +56,8 @@ pub fn object_key(file_id: &str) -> String {
 
 /// What deleting a file touches; a fake implements it in tests.
 pub trait FileParts {
-    async fn delete_index_markers(&self, file_id: &str) -> Result<()>;
+    async fn delete_markers(&self, file_id: &str) -> Result<()>;
+    async fn delete_derived(&self, file_id: &str) -> Result<()>;
     async fn delete_chunks(&self, file_id: &str) -> Result<()>;
     async fn delete_object(&self, key: &str) -> Result<()>;
     async fn delete_file_row(&self, file_id: &str) -> Result<()>;
@@ -62,11 +68,13 @@ pub trait FileParts {
 /// when there is nothing left, so a retry after a failure at any step
 /// finishes the job.
 pub async fn delete(parts: &impl FileParts, file_id: &str) -> Result<()> {
-    // The index markers first: retrieval sees chunks only through
-    // doc_chunks_current, which joins the run registry, so the file drops
-    // out of every answer at once.
-    parts.delete_index_markers(file_id).await?;
-    // The chunks, no longer seen by anyone.
+    // The markers of the runs made from the file first (index, document, mentions):
+    // retrieval and the document views see rows only through the run
+    // registry, so the file drops out of every answer and every list at once.
+    parts.delete_markers(file_id).await?;
+    // The rows, no longer seen by anyone: the document read from the file
+    // and the keywords of its chunks, then the chunks.
+    parts.delete_derived(file_id).await?;
     parts.delete_chunks(file_id).await?;
     parts.delete_object(&object_key(file_id)).await?;
     // The row last: while it is there, the file is listed and a retried
@@ -81,8 +89,11 @@ pub struct Stores<'a> {
 }
 
 impl FileParts for Stores<'_> {
-    async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
-        self.store.delete_index_markers(file_id).await
+    async fn delete_markers(&self, file_id: &str) -> Result<()> {
+        self.store.delete_markers(file_id).await
+    }
+    async fn delete_derived(&self, file_id: &str) -> Result<()> {
+        self.store.delete_derived(file_id).await
     }
     async fn delete_chunks(&self, file_id: &str) -> Result<()> {
         self.store.delete_chunks(file_id).await
@@ -131,14 +142,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_text_files() {
+    fn accepts_text_and_pdf_files() {
         assert_eq!(validate("notes.md", b"# Notes"), Ok(()));
         assert_eq!(validate("README.TXT", "привет".as_bytes()), Ok(()));
+        assert_eq!(validate("paper.PDF", b"%PDF-1.7\n\xff\xfe binary"), Ok(()));
     }
 
     #[test]
     fn refuses_what_cannot_be_indexed() {
-        assert!(validate("photo.png", b"x").unwrap_err().contains("only text files"));
+        assert!(validate("photo.png", b"x").unwrap_err().contains("only text and PDF files"));
+        assert_eq!(validate("renamed.pdf", b"just text"), Err("the file is not a PDF".into()));
         assert!(validate("noextension", b"x").is_err());
         assert!(validate("../etc/passwd.txt", b"x").unwrap_err().contains("no slashes"));
         assert_eq!(validate("empty.txt", b""), Err("the file is empty".into()));
@@ -167,8 +180,11 @@ mod tests {
     }
 
     impl FileParts for FakeParts {
-        async fn delete_index_markers(&self, file_id: &str) -> Result<()> {
+        async fn delete_markers(&self, file_id: &str) -> Result<()> {
             self.step("markers", file_id)
+        }
+        async fn delete_derived(&self, file_id: &str) -> Result<()> {
+            self.step("derived", file_id)
         }
         async fn delete_chunks(&self, file_id: &str) -> Result<()> {
             self.step("chunks", file_id)
@@ -187,7 +203,7 @@ mod tests {
 
         delete(&parts, "abc").await.unwrap();
 
-        assert_eq!(*parts.calls.borrow(), ["markers abc", "chunks abc", "object files/abc", "row abc"]);
+        assert_eq!(*parts.calls.borrow(), ["markers abc", "derived abc", "chunks abc", "object files/abc", "row abc"]);
     }
 
     #[tokio::test]
@@ -196,7 +212,7 @@ mod tests {
 
         assert!(delete(&parts, "abc").await.is_err());
         // The row is still there: the file is listed, and the retry finds it.
-        assert_eq!(*parts.calls.borrow(), ["markers abc", "chunks abc"]);
+        assert_eq!(*parts.calls.borrow(), ["markers abc", "derived abc", "chunks abc"]);
 
         delete(&parts, "abc").await.unwrap();
         assert_eq!(parts.calls.borrow().last().unwrap(), "row abc");

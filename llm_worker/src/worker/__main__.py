@@ -11,7 +11,10 @@ from temporalio.worker import Worker
 
 from workflow import TASK_QUEUE, ChatWorkflow, IndexWorkflow
 from workflow.activities.chat import Chatter
+from workflow.activities.document import Reader
 from workflow.activities.index import Indexer
+from workflow.activities.mentions import Extractor
+from workflow.activities.topic import TopicSteps
 
 # The activities are blocking and wait on the LLM server. index_file holds a
 # file and its chunks (tens of MB), so a few at a time.
@@ -46,12 +49,16 @@ async def main() -> None:
 
     client = await Client.connect(address, namespace=namespace)
     indexer = Indexer.from_env()
+    reader = Reader.from_env()
+    extractor = Extractor.from_env()
+    topics = TopicSteps.from_env()
     chatter = Chatter.from_env()
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[IndexWorkflow, ChatWorkflow],
-        activities=[indexer.index_file, chatter.retrieve, chatter.generate, chatter.record],
+        activities=[indexer.index_file, reader.read_document, extractor.extract_mentions, chatter.retrieve, chatter.generate, chatter.record,
+                    topics.route, topics.gather, topics.summarize],
         activity_executor=ThreadPoolExecutor(MAX_CONCURRENT),
         max_concurrent_activities=MAX_CONCURRENT,
     )

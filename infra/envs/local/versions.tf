@@ -29,8 +29,18 @@ data "terraform_remote_state" "cluster" {
   }
 }
 
+# The data stores, from their own layer: the same connection data a managed
+# database, object store and ClickHouse would give.
+data "terraform_remote_state" "stores" {
+  backend = "local"
+  config = {
+    path = var.stores_state_path
+  }
+}
+
 locals {
   cluster = data.terraform_remote_state.cluster.outputs
+  stores  = data.terraform_remote_state.stores.outputs
 }
 
 provider "kubernetes" {

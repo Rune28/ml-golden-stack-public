@@ -13,6 +13,10 @@ class IndexInput:
     # The uploaded file, made by be_service (POST /api/files).
     file_id: str
     run_id: str = ""
+    # The run that reads what the document is (read_document), made by be_service too.
+    document_run_id: str = ""
+    # The run that finds the keywords of the chunks (extract_mentions), made by be_service too.
+    mentions_run_id: str = ""
 
 
 @dataclass
@@ -23,6 +27,44 @@ class IndexResult:
     chunks: int
     chars: int
     embed_model: str
+    # Business key of the document the file is (doi:, isbn:, file:); empty
+    # for a workflow started before read_document was a step of Index.
+    document_id: str = ""
+    # Keywords found in the chunks, and the top themes of the document.
+    mentions: int = 0
+    themes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DocumentInput:
+    file_id: str
+    run_id: str
+
+
+@dataclass
+class MentionsInput:
+    file_id: str
+    # The index run whose chunks the keywords are found in.
+    index_run_id: str
+    run_id: str
+
+
+@dataclass
+class MentionsResult:
+    run_id: str
+    file_id: str
+    mentions: int
+    themes: int
+    top_themes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DocumentResult:
+    run_id: str
+    file_id: str
+    document_id: str
+    title: str
+    authors: int
 
 
 @dataclass
@@ -41,6 +83,8 @@ class ChatInput:
     turns: int = 0
     # Answers per workflow run before it continues as new.
     max_turns: int = 50
+    # Chunks an answer about a topic reads at most (rag.topics.MAX_CHUNKS).
+    max_topic_chunks: int = 60
 
 
 @dataclass
@@ -97,4 +141,50 @@ class RecordInput:
     turn: int
     question: str
     answer: str
+    sources: list[Source]
+
+
+@dataclass
+class RouteInput:
+    question: str
+
+
+@dataclass
+class Route:
+    kind: str = "fact"  # fact | topic
+    # The words of the message that name the topic.
+    terms: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GatherInput:
+    question: str
+    terms: list[str]
+    max_chunks: int = 60
+
+
+@dataclass
+class Broad:
+    """A term that is a theme of a whole document: in this many of its chunks."""
+
+    term: str
+    file_id: str
+    name: str
+    chunks: int
+
+
+@dataclass
+class Gathered:
+    mode: str  # chunks | too_broad | none
+    # The terms as stored (lemmas).
+    terms: list[str] = field(default_factory=list)
+    # Chunks the terms are keywords of; sources are the ones taken.
+    found: int = 0
+    broad: list[Broad] = field(default_factory=list)
+    sources: list[Source] = field(default_factory=list)
+
+
+@dataclass
+class SummarizeInput:
+    question: str
     sources: list[Source]

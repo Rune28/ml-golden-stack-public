@@ -4,9 +4,11 @@
 
 Documents, authors and concepts as Data Vault hubs with links, so a question about a topic finds every document on it. Plan, decisions and slices: [docs/documents-plan.md](docs/documents-plan.md).
 
-- [ ] S5 Documents: PDF, `hub_document`, `hub_author`, activity `read_document` in `Index`
-- [ ] S6 Concepts: Job `build_concepts` over the corpus: `hub_concept`, `broader` hierarchy, aliases, `concept_ancestors`, one run per graph
-- [ ] S7 Finding documents: `route` and `find_documents` in `Chat`
+- [x] S5 Documents: PDF, `sat_document`, `link_document_author`, hub views, activity `read_document` in `Index`
+- [x] S6a Keywords at upload: activity `extract_mentions` (TF-IDF within the document + bge-m3, no LLM), `chunk_mentions`, `document_themes`
+- [x] S7 Questions about a topic in `Chat`: `route`, `gather`, `summarize` (map → themes → a paragraph per theme)
+- [ ] S6b Concept graph: Job `build_concepts` over the corpus: canonical terms, `broader` hierarchy, aliases, `concept_ancestors`, one run per graph
+- [ ] Index runs replaced by a newer one are never deleted: every `reindex-all` keeps another copy of the chunks (readers do not see them)
 
 ## Done: LLM conveyor
 
@@ -26,10 +28,10 @@ Before S1: Ollama installed on the host (no sudo needed). 32 GB of RAM is welcom
 Postgres is a single instance (`modules/postgres-local`, one replica on one node). If its node goes down, Temporal loses its database. The three `cpu` nodes are already there to spread instances over.
 
 - [ ] CloudNativePG operator installed by its helm chart (CRDs handled as in [Helm charts and CRDs](#helm-charts-and-crds))
-- [ ] New module `postgres-cnpg` replaces `postgres-local` in `envs/local`: a `Cluster` with 3 instances, one primary and two replicas
+- [ ] New module `postgres-cnpg` replaces `postgres-local` in `stores/local`: a `Cluster` with 3 instances, one primary and two replicas
 - [ ] Instances spread one per `cpu` node (pod anti-affinity on `kubernetes.io/hostname`), PodDisruptionBudget
 - [ ] Automatic failover: when the primary goes down, a replica is promoted within seconds
-- [ ] Temporal connects to the `<cluster>-rw` service, which always points to the current primary. `modules/temporal` does not change, only `host`, `user` and `password` in `envs/local`
+- [ ] Temporal connects to the `<cluster>-rw` service, which always points to the current primary. `modules/temporal` and `envs/local` do not change, only the `postgres` outputs of `stores/local`
 - [ ] Failover drill: delete the primary pod, check that a replica is promoted and Temporal keeps serving (`temporal operator cluster health`, `temporal workflow list`)
 - [ ] Backups and WAL archive to SeaweedFS (S3 API, `modules/seaweedfs-local`). HA does not protect from `DROP TABLE`: it is replicated instantly
 
@@ -69,6 +71,18 @@ A first version was written and never run end to end, then removed. It is in com
 - [ ] End-to-end check: a pod requesting `nvidia.com/gpu: 1` on the `gpu` pool runs `nvidia-smi` and sees the host GPU
 - [ ] Model step manifests unchanged between `simulated` and `nvidia`
 - [ ] LLM server in a pod on the GPU: a module `llm-serving` (Ollama or vLLM) replaces `llm-local` in `envs/local` and keeps its contract: Service `llm` in namespace `llm`, port 80 named `http`, an OpenAI-compatible API under `/v1`, output `base_url`. Callers do not change. With one GPU shared by the LLM and train Jobs, NVIDIA time-slicing; a server per model (vLLM) needs a separate `LLM_EMBED_BASE_URL` in the adapter
+
+### Memory of the LLM server
+
+The memory budget of [docs/llm-plan.md](docs/llm-plan.md#memory-budget) gives Ollama about 1 GB, the weights being in VRAM. On 2026-10-19, after a day of indexing, keyword extraction and topic answers, `ollama.service` held 8.5 GB of host memory (1.4 GB in RAM, 7.1 GB in swap) while `ollama ps` showed `qwen3:4b` at 100% GPU. The host ran out of swap (load average up to 144); Temporal heartbeats, DNS in the cluster and the API server timed out; a restart of the service gave the memory back (0.7 GB right after).
+
+A first measurement, right after the restart: one topic answer (14 calls of qwen3) took `ollama.service` from 0.6 GB to 4.6 GB, of which 4.1 GB anonymous memory of a single `llama-server` (RSS 4.7 GB) with the model at 100% GPU: a host copy of the weights, it seems (read without mmap), that a model loaded again after the other one may not give back.
+
+- [ ] Measure what grows: memory of `ollama.service` (`memory.current`, `memory.swap.current` of its cgroup) over a run of `extract_mentions` on a book and over a few topic answers
+- [ ] Check the suspects one by one: the two models loaded in turn (bge-m3 for embeddings, qwen3 for chat) and their host buffers; the 8192-token context of every runner; requests queued while a long answer runs
+- [ ] Settings that bound it, if they help: `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_NUM_PARALLEL`, `OLLAMA_KEEP_ALIVE`; or a memory limit on the systemd user unit (`MemoryMax`, `MemorySwapMax`) so the server is restarted instead of the host swapping
+- [ ] The memory budget of the plan written again from what is measured
+- [ ] `make llm-check` reports the memory of the server next to the answer, so a leak is seen before the host swaps
 
 ## Pipeline correctness
 

@@ -47,18 +47,46 @@ class LLM:
             embed_model=os.environ["LLM_EMBED_MODEL"],
         )
 
-    def chat(self, messages: list[dict], model: str | None = None) -> Reply:
-        """messages: [{"role": "system" | "user" | "assistant", "content": str}, ...]"""
-        body = self._post("/chat/completions", {"model": model or self.chat_model, "messages": messages})
+    def chat(self, messages: list[dict], model: str | None = None, schema: dict | None = None,
+             think: bool = True) -> Reply:
+        """messages: [{"role": "system" | "user" | "assistant", "content": str}, ...]
+
+        schema: a JSON schema the answer must follow (structured output); the
+        text of the reply is then that JSON. think=False asks a model that
+        thinks before it answers (qwen3) not to: for reading fields out of a
+        text the thinking only costs time, on qwen3:4b a minute instead of a
+        second for the same answer."""
+        payload = {"model": model or self.chat_model, "messages": messages}
+        if schema is not None:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}
+        if not think:
+            payload["reasoning_effort"] = "none"
+        body = self._post("/chat/completions", payload)
         message = body["choices"][0]["message"]
         usage = body.get("usage") or {}
+        text = message.get("content") or ""
+        # A thinking model told not to think may think anyway and write it
+        # into the answer, up to </think>: only what follows is the answer.
+        if "</think>" in text:
+            text = text.rsplit("</think>", 1)[1].lstrip()
         return Reply(
-            text=message.get("content") or "",
+            text=text,
             model=body.get("model") or model or self.chat_model,
             reasoning=message.get("reasoning") or "",
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
         )
+
+    def chat_json(self, messages: list[dict], schema: dict, model: str | None = None) -> dict:
+        """An answer that follows `schema`, without thinking, parsed."""
+        reply = self.chat(messages, model=model, schema=schema, think=False)
+        try:
+            answer = json.loads(reply.text)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"/chat/completions: the answer is not JSON: {reply.text[:200]!r}") from e
+        if not isinstance(answer, dict):
+            raise LLMError(f"/chat/completions: the answer is not a JSON object: {reply.text[:200]!r}")
+        return answer
 
     def embed(self, texts: list[str], model: str | None = None) -> list[list[float]]:
         """One vector per text, in the order of the texts."""
