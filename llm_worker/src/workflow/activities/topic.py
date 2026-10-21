@@ -140,11 +140,11 @@ class TopicSteps:
         ).result_rows)
         q, calls = input.question, 0
 
-        def ask(prompt: str, schema: dict, passages: str | None = None) -> dict:
-            """One call; with passages, the prompt is the system message and they the user's."""
+        def ask(prompt: str, schema: dict, given: str | None = None) -> dict:
+            """One call; with given text (passages, notes), the prompt is the system message and the text the user's."""
             nonlocal calls
-            messages = ([{"role": "system", "content": prompt}, {"role": "user", "content": passages}]
-                        if passages is not None else [{"role": "user", "content": prompt}])
+            messages = ([{"role": "system", "content": prompt}, {"role": "user", "content": given}]
+                        if given is not None else [{"role": "user", "content": prompt}])
             answer = self.llm.chat_json(messages, schema)
             calls += 1
             activity.heartbeat(calls)
@@ -161,7 +161,7 @@ class TopicSteps:
         while len(render_notes(notes, limit=None)) > MAX_NOTES_CHARS:
             condensed = []
             for batch in note_batches(notes, MAX_NOTES_CHARS // 2):
-                answer = ask(CONDENSE_PROMPT.format(question=q, notes=render_notes(batch, limit=None)), MAP_SCHEMA)
+                answer = ask(CONDENSE_PROMPT, MAP_SCHEMA, render_notes(batch, limit=None))
                 condensed += notes_from(answer, {p for p, _ in batch})
             if not condensed or len(render_notes(condensed, limit=None)) >= len(render_notes(notes, limit=None)):
                 break  # no shorter: render_notes cuts at the limit instead
@@ -175,8 +175,8 @@ class TopicSteps:
         for theme, mine in themes:
             text = render_notes([n for n in notes if n[0] in mine])
             for _ in range(2):  # one more try for a paragraph that cites nothing
-                paragraph = str(ask(PARAGRAPH_PROMPT.format(question=q, theme=theme, notes=text),
-                                    PARAGRAPH_SCHEMA).get("paragraph") or "").strip()
+                paragraph = str(ask(PARAGRAPH_PROMPT.format(theme=theme), PARAGRAPH_SCHEMA, text)
+                                .get("paragraph") or "").strip()
                 if cites(paragraph, mine):
                     paragraphs.append((theme, paragraph))
                     break

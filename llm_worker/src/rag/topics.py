@@ -101,27 +101,23 @@ Notes:
 
 PARAGRAPH_SCHEMA = {"type": "object", "properties": {"paragraph": {"type": "string"}}, "required": ["paragraph"]}
 
-PARAGRAPH_PROMPT = """Write one paragraph of an answer to the question, on one theme, from the notes below.
-Say what the notes have in common and where they differ, in 3 to 5 sentences, in the language of the question,
-citing passages as [3]. Start with the idea itself: no "the notes say", no restating the question, no list of
+# The paragraph and condense steps never see the question: the theme carries
+# its focus, the notes its language. Given a long message (a dream retold
+# over 700 characters), qwen3 answered the message instead and cited its
+# sentences as passages; the instructions now go in the system message and
+# the notes in the user's, as in the map step.
+PARAGRAPH_PROMPT = """Write one paragraph on the theme below from the notes the user gives, taken on numbered
+passages of the user's documents. Say what the notes have in common and where they differ, in 3 to 5 sentences,
+in the language of the notes, citing passages as [3]. Start with the idea itself: no "the notes say", no list of
 passages. Keep whose words a point is as the notes give it. Use only the notes.
 
-Question: {question}
-Theme: {theme}
-
-Notes:
-{notes}"""
+Theme: {theme}"""
 
 # The second level of the reduce: notes too many for one call are condensed a
 # batch at a time, keeping their passage numbers, until they fit.
-CONDENSE_PROMPT = """Below are notes taken on numbered passages of the user's documents about the question.
+CONDENSE_PROMPT = """The user gives notes taken on numbered passages of the user's documents.
 Merge the notes that say the same thing and shorten the rest: one note per point, each with the number
-of a passage it comes from, in the language of the question. Keep whose words a point is. Use only the notes.
-
-Question: {question}
-
-Notes:
-{notes}"""
+of a passage it comes from, in the language of the notes. Keep whose words a point is. Use only the notes."""
 
 # The notes the reduce step reads, at most: with the prompt, they fit the context.
 MAX_NOTES_CHARS = 12_000

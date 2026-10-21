@@ -144,9 +144,9 @@ def test_summarize_takes_notes_then_themes_then_a_paragraph_per_theme(monkeypatc
     map_one, map_two, themes, first, _, second = llm.prompts
     assert "[1] book.txt\ntext 0" in map_one[1]["content"] and "[3] book.txt\ntext 2" in map_two[1]["content"]
     assert themes[0]["content"].endswith("[1] death is in life\n[2] death repeats\n[3] death is a curve")
-    # A paragraph sees the notes of its theme only.
-    assert first[0]["content"].endswith("Notes:\n[1] death is in life")
-    assert second[0]["content"].endswith("Notes:\n[2] death repeats\n[3] death is a curve")
+    # A paragraph sees the notes of its theme only, as the user's message.
+    assert "Theme: in life" in first[0]["content"] and first[1]["content"] == "[1] death is in life"
+    assert second[1]["content"] == "[2] death repeats\n[3] death is a curve"
     assert generated.text == "**in life**\nDeath is part of life [1].\n\n**infinity**\nDeath repeats like a curve [2, 3]."
     assert beats == [1, 2, 3, 4, 5, 6]
 
@@ -165,9 +165,32 @@ def test_notes_too_many_for_one_call_are_condensed_first(monkeypatch):
     generated = ActivityEnvironment().run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
                                           SummarizeInput(question="q", sources=sources))
 
-    assert "Merge the notes" in llm.prompts[1][0]["content"]
+    assert "Merge the notes" in llm.prompts[1][0]["content"] and llm.prompts[1][1]["content"] == f"[1] {'a' * 30}"
     assert llm.prompts[3][0]["content"].endswith("[1] short a\n[2] short b")
     assert generated.text == "**t**\na and b [1]"
+
+
+def test_the_question_never_reaches_the_steps_that_write_from_notes(monkeypatch):
+    # A dream retold as the question came back as the answer, its sentences
+    # cited as passages of a book: the paragraph step answered the question.
+    monkeypatch.setattr(topic_module, "MAX_NOTES_CHARS", 40)
+    question = "Вопрос про сон: сначала ты летишь и смотришь на магистраль, потом акробатика и людоеды"
+    sources = [Source(file_id="b", index_run_id="i", chunk_id=n, name="book.txt") for n in range(2)]
+    llm = FakeLLM(answers=[
+        {"notes": [{"passage": 1, "note": "a" * 30}, {"passage": 2, "note": "b" * 30}]},
+        {"notes": [{"passage": 1, "note": "short a"}]},
+        {"notes": [{"passage": 2, "note": "short b"}]},
+        {"themes": [{"theme": "сон", "passages": [1, 2]}]},
+        {"paragraph": "a and b [1]"},
+    ])
+
+    ActivityEnvironment().run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
+                              SummarizeInput(question=question, sources=sources))
+
+    _, condense_one, condense_two, themes, paragraph = llm.prompts
+    assert question in themes[0]["content"]  # themes are chosen to answer it
+    for messages in (condense_one, condense_two, paragraph):
+        assert not any("магистраль" in m["content"] for m in messages)
 
 
 def test_themes_are_checked_and_a_passage_belongs_to_one_theme():
