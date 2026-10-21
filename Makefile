@@ -26,7 +26,7 @@ endif
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         stores-init stores-plan stores-up stores-down \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat chat-ui chat-ui-service \
+        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat chat-ui chat-ui-service k9s \
         preflight check-owner host-setup test fmt validate
 
 help:
@@ -58,6 +58,7 @@ help:
 	@echo "chat Q=\"...\"      a question about the files; prints CHAT=<id>, pass it to go on in that chat"
 	@echo "chat-ui          the chat page on http://127.0.0.1:9002 (a port-forward that restarts itself, Ctrl+C to stop)"
 	@echo "chat-ui-service  the same as a systemd user service: always on :9002, also after reboots"
+	@echo "k9s              the cluster in k9s, all namespaces (k9s itself is installed on the host, not in the cluster)"
 	@echo "test             unit tests of be_service, batch_worker, llm_worker and mle_models"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
@@ -230,6 +231,13 @@ chat-ui-service:
 	  '[Install]' 'WantedBy=default.target' > ~/.config/systemd/user/chat-ui.service
 	systemctl --user daemon-reload && systemctl --user enable --now chat-ui
 	@echo "chat page on http://127.0.0.1:9002; logs: journalctl --user -u chat-ui"
+
+# A terminal UI over the cluster, as kubectl is: a client on the host. The
+# kind kubeconfig is not ~/.kube/config, so k9s is given it here; -A starts
+# in all namespaces, since nothing of the platform runs in default.
+k9s:
+	@command -v k9s >/dev/null || { echo "k9s is not installed: https://k9scli.io/topics/install/"; exit 1; }
+	KUBECONFIG=$(KUBECONFIG) k9s -A
 
 test:
 	cd be_service && cargo test

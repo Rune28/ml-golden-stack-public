@@ -1,0 +1,56 @@
+# Login and per-user data, on the way to ZTNA
+
+The chat page is open to anyone who reaches it, and every file and every chat is everyone's. This stage adds a login window and makes the files, the documents, the chats and the answers of a user their own. It is built so that it grows into zero-trust network access (ZTNA) without rewriting the services: every request is authenticated and authorized by the service it reaches, not let through because it comes from inside the cluster.
+
+## Why this layout
+
+```
+browser ──session cookie──▶ chat_service ──signed token (the principal)──▶ be_service ──user_id──▶ workflows, ClickHouse
+           login, session    an EdDSA JWT on every call,                   verifies it with the public     reads through views
+           (Postgres)        signed with its private key                   key on every call               of what the user may see
+```
+
+1. **be_service trusts no header as it is.** Today only chat_service calls it, but in ZTNA the network is not trusted: the principal comes as a signed JWT, and be_service checks the signature, the audience and the expiry on every request.
+2. **Only the issuer holds the key that signs.** chat_service signs with a private key; be_service has only the public one, so it cannot make a token for anyone. Later an identity provider (Keycloak, Dex, a company's Google or Entra) behind an identity-aware proxy (oauth2-proxy, Pomerium) issues the token and be_service takes the public keys from its JWKS: the check stays, the source of the key changes. The same seam as `llm-local` for the model server.
+3. **Isolation is a structure, not a filter remembered in every query.** What a user may see is read through parameterized views (`doc_chunks_visible(user_id)` and the like); readers read only views (rule 11), so a reader that forgot the user cannot get past them. The boundary covers retrieval too: an answer in the chat is built only from chunks of the user's files.
+
+| Part | Role |
+|---|---|
+| **chat_service** | the login window, users, identities and sessions in its own Postgres database (principle 9), a short JWT on every call to the platform |
+| **be_service** | verifies the token, reads and writes for the `user_id` in it, owns the links of files and chats to users |
+| **llm_worker** | retrieval, gathering and summarizing get the `user_id` of the message and read through the visible views; an empty one reads nothing |
+
+## Decisions
+
+1. **Users, identities and sessions are in Postgres, not ClickHouse.** They change (a session is revoked, a password changed) and need transactions and point reads. chat_service gets its own database through `modules/postgres-database`, as MLflow does.
+2. **Migrations of that database are a Job, as for ClickHouse.** `db/postgres/chat/migrations`, applied by golang-migrate (the image already used for ClickHouse) before chat_service starts (`depends_on`, rule 10): one mechanism for every store, expand then contract.
+3. **A user is our own `user_id`; how they log in is an identity.** `users(user_id, email, created_at, disabled_at)` and `identities(provider, subject, user_id, secret)`, with `provider = 'password'`, `subject` the email and `secret` the argon2id hash today. An identity provider later is another row, `provider = 'oidc:<issuer>'` and its `sub`, for the same `user_id`: the owner links of the files do not change.
+4. **Users are created by an admin.** `make user-add EMAIL=...` and `make user-password EMAIL=...` ask for the password and run commands of the chat_service image in its pod; the page has a login form and no sign-up. An admin is whoever has `kubectl` on the cluster. A company's identity provider works the same way; an open sign-up needs spam protection and email confirmation first.
+5. **Passwords:** argon2id; a wrong email and a wrong password give the same answer in the same time (an unknown email is hashed against a dummy). After 5 failures for an email in 15 minutes, or 100 for the whole service, a login is refused for a while (429), counted in Postgres so every replica sees the same count. Not per address: behind the port-forward every request comes from 127.0.0.1, and a limit per address blocks everyone; it comes with a trusted proxy that reports the client's address.
+6. **Sessions:** a random 32-byte token in a cookie `HttpOnly`, `Secure`, `SameSite=Strict`; `Secure` everywhere, since browsers treat `http://localhost` and `127.0.0.1` as secure. Postgres keeps only its sha256, an expiry (12 hours, renewed while used) and a revocation; logout revokes it. A request that changes something, the login included, must carry an `Origin` equal to the page's own: with `SameSite`, the guard against CSRF.
+7. **Validation on both sides, from one source.** chat_service checks every field and is the authority. The page reads the same rules from `GET /api/auth/rules` (email 3–254 characters with one `@`, password 12–128 characters, not the email) and checks them before sending, for the user's sake; the rules are written once.
+8. **The token to the platform:** EdDSA (Ed25519) JWT, `sub` = `user_id`, `aud` = `platform`, `iss` = `chat-service`, 5 minutes, made per call. The private key is a Secret of chat_service only; the public key reaches be_service through a named ConfigMap, `platform-token` (the seam of infra/CLAUDE.md). be_service refuses a product route without a valid token with 401; `/healthz` stays open.
+9. **Ownership is a link, not a column.** `file_id` is the sha256 of the bytes, so the same file of two users is one file: `file_owners(file_id, user_id)` and `chat_owners(chat_id, user_id)` in ClickHouse, reference data with a natural key (principle 4: they come from users, not from runs). A second user uploading the same bytes gets a link and no second index. Deleting a file removes the link of that user; the file and everything made from it go when no owner is left.
+10. **An upload does not tell a user what others have.** The answer to an upload says `duplicate` only for a file the user already owns; for bytes another user has, it reads as a new upload. What still shows is the time: such a file is indexed at once. A known limit, written down; closing it means indexing a copy per user.
+11. **Visible views, parameterized by `user_id`:** `files_visible`, `doc_chunks_visible`, `documents_visible`, `chunk_mentions_visible`, `document_themes_visible`, `chats_visible`, `chat_messages_visible`, each the current view joined with the owner links. Readers of user data (be_service, retrieve, gather, summarize, generate, the texts of chunks included) read only these. A test in each service fails when its reading code names a user-scoped table or current view directly; a writer checking its own progress still reads its table (db/CLAUDE.md).
+12. **The identity travels with every message, not in the workflow.** be_service checks that the chat is the user's and passes the `user_id` in `MessageInput`; the steps read through the visible views with it. The workflow keeps no identity, so chats started before this stage keep working, and a message is authorized when it comes. An activity given an empty `user_id` reads nothing (fail closed).
+13. **The data of today goes to the first admin.** `make adopt-orphans EMAIL=...` links every file and chat without an owner to that user, once.
+14. **Scope of the token:** the product routes of be_service (files, documents, chats) need it; the MNIST page and its routes (batches, train, run, report) stay as they are until the platform page has an admin login of its own (Later). `make` targets that call be_service directly get a token from `make token EMAIL=...`.
+15. **Derived data that crosses documents must keep the boundary too.** The concept graph (S6b of [documents-plan.md](documents-plan.md)) is built over the whole corpus, and a concept such as a character of a novel tells what a book is. Its readers see a concept only through documents the user owns; settling how is part of S6b, before it is built.
+
+## Slices
+
+A1 and A2 are released together: after A1 alone, users would log in and still share everything.
+
+| # | Slice | Built | Critical part | Done when |
+|---|---|---|---|---|
+| A1 | Login | database `chat`, its migrations as a Job (`users`, `identities`, `sessions`, `login_failures`); `/api/auth/login`, `/logout`, `/me`, `/rules`; the login form and its checks on the page; `Origin` check; `make user-add`, `make user-password`; every route of chat_service behind a session | the session check and the failure counter | without a session the page shows only the login form; a wrong password and an unknown email look and take the same; the sixth failed login for an email is refused; logout ends the session in every tab |
+| A2 | Principal and ownership | EdDSA JWT from chat_service, public key to be_service; migrations `file_owners`, `chat_owners` and the visible views; be_service reads through them, links on upload, unlinks on delete, no cross-user `duplicate`; `MessageInput.user_id` and the steps of an answer on the visible views; the test against reading raw tables; `make adopt-orphans`, `make token`, `make auth-check` | the token check in be_service, the visible views, retrieval on them | `make auth-check` passes: two users, each with their own book, see only their files, documents and chats; a question of one is never answered from the other's book; a `file_id` or `chat_id` of the other is 404; the same file of both is indexed once and its upload by the second does not say `duplicate`; a call to be_service without a token is 401 |
+
+## Later (the way to ZTNA)
+
+An identity provider (Keycloak or Dex) and an identity-aware proxy in front of chat_service; be_service taking public keys from its JWKS · mTLS between services (cert-manager, or a mesh) · NetworkPolicies denying everything not allowed · authorization rules outside the code (OPA) · an access log of who read what · device posture through the proxy · a limit of logins per client address, behind a trusted proxy · an admin login for the platform (MNIST) page · open sign-up with email confirmation · sharing a file or a chat with another user (a second owner link) · indexing a copy per user, if the time an upload takes must not tell anything.
+
+## Memory budget
+
+Postgres is already in the cluster; a database and a few small tables add nothing to speak of. chat_service grows by a connection pool (a few MB). See the memory budget of [llm-plan.md](llm-plan.md#memory-budget) and the open item on the memory of the LLM server in BACKLOG.

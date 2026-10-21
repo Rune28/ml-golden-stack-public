@@ -177,6 +177,7 @@ async def test_a_topic_is_gathered_from_its_chunks_and_summarized(chat):
 
     assert [name for name, _ in steps.calls] == ["route", "gather", "summarize", "record"]
     assert steps.of("gather")[0].terms == ["смерти"]
+    assert steps.of("gather")[0].min_chunks == ChatInput("c").min_topic_chunks
     assert steps.of("summarize")[0].sources == TOPIC
     [record] = steps.of("record")
     assert (record.answer, record.sources) == ("summary of 2 chunks", TOPIC)

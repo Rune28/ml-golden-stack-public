@@ -10,7 +10,7 @@ Stream work (README, rule 12), blocking, on the worker's thread pool.
   documents (document_themes_current, in more than MAX_SHARE of their
   chunks, so never a keyword of one chunk) narrows the documents. Only
   themes of whole documents: the topic is too broad to gather. Nothing
-  found: the question is answered as a fact.
+  found, or fewer chunks than min_chunks: the question is answered as a fact.
 - summarize reads the chunks a group at a time and takes notes (map);
   condenses the notes a batch at a time while they are too many for one
   call; groups them into themes; writes a paragraph per theme from its notes
@@ -105,6 +105,10 @@ class TopicSteps:
         if broad_terms:
             files = {b.file_id for b in broad if b.term in broad_terms}
             found = {c for c in found if c[0] in files} or found
+        if len(found) < input.min_chunks:
+            # Too few for a topic: the chunks closest to the question say more.
+            log.info("topic %s: %d chunks found, answered as a fact", stored, len(found))
+            return Gathered(mode="none", terms=stored, found=len(found))
         keys = sorted(found)
         if len(keys) > input.max_chunks:
             keys = self.closest(client, input.question, keys, input.max_chunks)

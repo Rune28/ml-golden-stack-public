@@ -85,6 +85,8 @@ class ChatInput:
     max_turns: int = 50
     # Chunks an answer about a topic reads at most (rag.topics.MAX_CHUNKS).
     max_topic_chunks: int = 60
+    # Fewer chunks found for a topic: answered as a fact (rag.topics.MIN_CHUNKS).
+    min_topic_chunks: int = 6
 
 
 @dataclass
@@ -161,6 +163,8 @@ class GatherInput:
     question: str
     terms: list[str]
     max_chunks: int = 60
+    # Fewer chunks found: answered as a fact (rag.topics.MIN_CHUNKS).
+    min_chunks: int = 6
 
 
 @dataclass

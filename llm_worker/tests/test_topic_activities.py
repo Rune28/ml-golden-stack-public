@@ -43,9 +43,10 @@ class FakeLLM:
         return self.answers.pop(0) if self.answers else {"answer": "final answer [1]"}
 
 
-def gather(clickhouse, terms, question="q"):
+def gather(clickhouse, terms, question="q", min_chunks=1):
+    """By default any number of chunks is a topic: the tests of which chunks are taken use a few."""
     steps = TopicSteps(lambda: clickhouse, FakeLLM())
-    return ActivityEnvironment().run(steps.gather, GatherInput(question=question, terms=terms))
+    return ActivityEnvironment().run(steps.gather, GatherInput(question=question, terms=terms, min_chunks=min_chunks))
 
 
 def test_the_words_of_a_question_become_stored_terms():
@@ -96,6 +97,18 @@ def test_a_word_that_names_nothing_stored_falls_back_to_a_fact():
 
     assert gather(clickhouse, ["Пруст", "квазары"]).mode == "none"
     assert gather(FakeClickHouse(), ["квазары"]).mode == "none"
+
+
+def test_a_topic_in_too_few_chunks_falls_back_to_a_fact():
+    # "Настоящая жизнь" was a keyword of one chunk of a book; summarized alone,
+    # that chunk came back retold, a quote of Proust in the first person.
+    clickhouse = FakeClickHouse(mentions=[("настоящая жизнь", "book", "idx", 188)])
+
+    gathered = gather(clickhouse, ["настоящая жизнь"], min_chunks=topics.MIN_CHUNKS)
+
+    assert (gathered.mode, gathered.found, gathered.sources) == ("none", 1, [])
+    many = FakeClickHouse(mentions=[("смерть", "b", "i", n) for n in range(topics.MIN_CHUNKS)])
+    assert gather(many, ["смерть"], min_chunks=topics.MIN_CHUNKS).mode == "chunks"
 
 
 def test_more_chunks_than_an_answer_reads_are_cut_to_the_closest():

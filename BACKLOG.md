@@ -10,6 +10,13 @@ Documents, authors and concepts as Data Vault hubs with links, so a question abo
 - [ ] S6b Concept graph: Job `build_concepts` over the corpus: canonical terms, `broader` hierarchy, aliases, `concept_ancestors`, one run per graph
 - [ ] Index runs replaced by a newer one are never deleted: every `reindex-all` keeps another copy of the chunks (readers do not see them)
 
+## Next: login and per-user data
+
+A login window and files, documents, chats and answers of every user their own, built to grow into ZTNA. Plan, decisions and slices: [docs/auth-plan.md](docs/auth-plan.md).
+
+- [ ] A1 Login: users and sessions in Postgres (chat_service), login form with checks on both sides, `make user-add`
+- [ ] A2 Principal and ownership: JWT from chat_service to be_service, `file_owners`, `chat_owners`, retrieval filtered by the user
+
 ## Done: LLM conveyor
 
 Upload files, index them for retrieval, chat about them with a memory of the conversation. Plan, decisions and slices: [docs/llm-plan.md](docs/llm-plan.md).

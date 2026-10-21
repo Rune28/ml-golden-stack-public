@@ -18,6 +18,11 @@ from rag.mentions import candidates
 # chunks), in about two and a half minutes; 200 would take some eight, past
 # what the chat page waits, and keep the model server from every other chat.
 MAX_CHUNKS = 60
+# A topic in fewer chunks is answered as a fact: retrieve reads 5 chunks
+# closest to the whole question, and a map-reduce over one or two chunks
+# retells them. "Настоящая жизнь" was a keyword of a single chunk of a book,
+# cut in the middle of the thought, and its answer was that chunk retold.
+MIN_CHUNKS = 6
 # Chunks per call of the map step: they fit the context of a small model.
 GROUP = 6
 
@@ -60,7 +65,8 @@ MAP_SCHEMA = {
 MAP_PROMPT = """You read numbered passages from the user's documents and write down what they say
 about the question below: one short note per point, with the number of its passage.
 Use only the passages; an empty list if none of them says anything about it.
-Write the notes in the language of the question.
+Passages often quote other authors: say whose words a point is ("Proust writes that..."), and never
+write the "I" of a quote as your own. Write the notes in the language of the question.
 
 Question: {question}"""
 
@@ -98,7 +104,7 @@ PARAGRAPH_SCHEMA = {"type": "object", "properties": {"paragraph": {"type": "stri
 PARAGRAPH_PROMPT = """Write one paragraph of an answer to the question, on one theme, from the notes below.
 Say what the notes have in common and where they differ, in 3 to 5 sentences, in the language of the question,
 citing passages as [3]. Start with the idea itself: no "the notes say", no restating the question, no list of
-passages. Use only the notes.
+passages. Keep whose words a point is as the notes give it. Use only the notes.
 
 Question: {question}
 Theme: {theme}
@@ -110,7 +116,7 @@ Notes:
 # batch at a time, keeping their passage numbers, until they fit.
 CONDENSE_PROMPT = """Below are notes taken on numbered passages of the user's documents about the question.
 Merge the notes that say the same thing and shorten the rest: one note per point, each with the number
-of a passage it comes from, in the language of the question. Use only the notes.
+of a passage it comes from, in the language of the question. Keep whose words a point is. Use only the notes.
 
 Question: {question}
 

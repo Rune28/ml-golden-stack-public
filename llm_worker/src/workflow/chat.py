@@ -55,6 +55,7 @@ class ChatWorkflow:
         self.turns = input.turns
         self.max_turns = input.max_turns
         self.max_topic_chunks = input.max_topic_chunks
+        self.min_topic_chunks = input.min_topic_chunks
         self.answered = 0  # in this run
         # Updates run concurrently as soon as they arrive; the lock queues them.
         self.lock = asyncio.Lock()
@@ -66,7 +67,7 @@ class ChatWorkflow:
         await workflow.wait_condition(lambda: self.answered >= self.max_turns and workflow.all_handlers_finished())
         workflow.continue_as_new(
             ChatInput(chat_id=self.chat_id, history=self.history, turns=self.turns, max_turns=self.max_turns,
-                      max_topic_chunks=self.max_topic_chunks)
+                      max_topic_chunks=self.max_topic_chunks, min_topic_chunks=self.min_topic_chunks)
         )
 
     @workflow.update(name="send_message")
@@ -125,7 +126,8 @@ class ChatWorkflow:
         if route.kind != "topic":
             return None
         gathered = await workflow.execute_activity(
-            GATHER, GatherInput(question=message.text, terms=route.terms, max_chunks=self.max_topic_chunks),
+            GATHER, GatherInput(question=message.text, terms=route.terms, max_chunks=self.max_topic_chunks,
+                                min_chunks=self.min_topic_chunks),
             result_type=Gathered,
             start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
         )
