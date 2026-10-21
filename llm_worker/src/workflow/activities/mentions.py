@@ -7,8 +7,9 @@ every chunk over the whole text (lemmas and counts of a book: seconds),
 then goes a batch of chunks at a time: their vectors from doc_chunks, the
 vectors of their candidates from the embedding model, the top five per
 chunk, an insert and a heartbeat. So the worker holds the vectors of one
-batch, not of the whole file. The themes of the document come from the
-counts, last.
+batch, not of the whole file. The vectors of the terms written are kept
+too (term_vectors), once per run: a question finds the terms close to its
+own words by them. The themes of the document come from the counts, last.
 
 Idempotent per run_id, like read_document: a committed run is returned as
 it is; rows of an attempt that died before its marker are deleted and the
@@ -68,16 +69,18 @@ class Extractor:
         # Rows of an earlier attempt of this run, which died before its marker.
         partial = client.query(
             "SELECT (SELECT count() FROM chunk_mentions WHERE run_id = {r:String}) "
+            "+ (SELECT count() FROM term_vectors WHERE run_id = {r:String}) "
             "+ (SELECT count() FROM document_themes WHERE run_id = {r:String})",
             parameters=own,
         ).result_rows[0][0]
         if partial:
             client.command("DELETE FROM chunk_mentions WHERE run_id = {r:String}", parameters=own)
+            client.command("DELETE FROM term_vectors WHERE run_id = {r:String}", parameters=own)
             client.command("DELETE FROM document_themes WHERE run_id = {r:String}", parameters=own)
 
-        mentions = 0
+        mentions, kept = 0, set()  # kept: the terms whose vectors are written
         for start in range(0, len(ids), BATCH):
-            mentions += self.write_batch(client, input, ids[start : start + BATCH], best[start : start + BATCH])
+            mentions += self.write_batch(client, input, ids[start : start + BATCH], best[start : start + BATCH], kept)
             activity.heartbeat(start + BATCH)
 
         found = themes(df, len(ids))
@@ -95,8 +98,9 @@ class Extractor:
         return MentionsResult(run_id=input.run_id, file_id=input.file_id, mentions=mentions, themes=len(found),
                               top_themes=[t.term for t in found[:TOP_THEMES]])
 
-    def write_batch(self, client, input: MentionsInput, ids: list[int], best: list[list[str]]) -> int:
-        """The top terms of a batch of chunks, inserted; their number."""
+    def write_batch(self, client, input: MentionsInput, ids: list[int], best: list[list[str]], kept: set[str]) -> int:
+        """The top terms of a batch of chunks, inserted, and the vectors of
+        those not in `kept` (which grows); the number of terms."""
         chunks = dict(client.query(
             "SELECT chunk_id, embedding FROM doc_chunks WHERE run_id = {i:String} AND chunk_id IN {ids:Array(UInt32)}",
             parameters={"i": input.index_run_id, "ids": ids},
@@ -116,6 +120,15 @@ class Extractor:
                 "chunk_mentions", rows,
                 column_names=["run_id", "file_id", "index_run_id", "chunk_id", "term", "rank", "score"],
             )
+        # A term is a keyword of many chunks: its vector once per run.
+        new = sorted({row[4] for row in rows} - kept)
+        if new:
+            client.insert(
+                "term_vectors",
+                [[input.run_id, input.file_id, term, self.llm.embed_model, vectors[term]] for term in new],
+                column_names=["run_id", "file_id", "term", "embed_model", "embedding"],
+            )
+            kept.update(new)
         return len(rows)
 
 

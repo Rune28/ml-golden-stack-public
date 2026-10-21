@@ -1,6 +1,6 @@
 # llm_worker
 
-Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). The workflow `Index` with its activities `index_file` and `read_document`, and the entity workflow `Chat` (one per conversation, a message is an Update) with `retrieve`, `generate` and `record`. No Kubernetes client: this worker starts no Jobs.
+Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). The workflow `Index` with its activities `index_file`, `read_document` and `extract_mentions`, and the entity workflow `Chat` (one per conversation, a message is an Update) with `route`, then `gather` and `summarize` for a topic or `retrieve` and `generate` for a fact, and `record`. `route` tells a fact, a topic, or the user's own story to interpret (answered as a fact: retrieved by the message as written) and reads a short query a topic is gathered and themed by. No Kubernetes client: this worker starts no Jobs.
 
 `rag` is chunking, PDF text and the keys and metadata of documents, with no I/O (principle 2); `workflow/llm.py` is the adapter to the model server.
 

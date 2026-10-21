@@ -220,3 +220,48 @@ async def test_chunks_of_a_topic_that_say_nothing_about_the_question_leave_it_to
 
     assert [name for name, _ in steps.calls] == ["route", "gather", "summarize", "retrieve", "generate", "record"]
     assert answer.sources == [SOURCE]
+
+
+async def test_a_topic_is_gathered_by_its_query_and_its_notes_taken_on_the_message(chat):
+    # A message retold around its question was gathered by its story.
+    steps, start = chat
+    message = "Вопрос про сон. Сначала ты летишь и смотришь на магистраль..."
+    steps.route_to = Route(kind="topic", terms=["сон"], query="меняет ли сон человека?")
+    steps.summary = ""  # so the fact branch runs too
+    _, send = await start()
+
+    await send(message)
+
+    assert steps.of("gather")[0].question == "меняет ли сон человека?"
+    [summarize] = steps.of("summarize")
+    assert (summarize.question, summarize.query) == (message, "меняет ли сон человека?")
+    # A fact is searched by the message: the story finds the passages about it.
+    assert steps.of("retrieve")[0].question == message
+    assert steps.of("generate")[0].question == message
+    assert steps.of("record")[0].question == message
+
+
+async def test_a_story_to_interpret_is_answered_from_the_chunks_closest_to_it(chat):
+    # A dream sent to a topic came back an overview of the book that never
+    # saw the question; from the closest chunks, an answer about that dream.
+    steps, start = chat
+    message = "как бы ты описал этот сон? мне снилось, что я лечу над магистралью"
+    steps.route_to = Route(kind="interpret", terms=["сон"], query="как описать этот сон?")
+    _, send = await start()
+
+    answer = await send(message)
+
+    assert [name for name, _ in steps.calls] == ["route", "retrieve", "generate", "record"]
+    assert steps.of("retrieve")[0].question == message and steps.of("generate")[0].question == message
+    assert answer.sources == [SOURCE]
+
+
+async def test_a_topic_without_a_query_is_gathered_by_the_message(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["смерти"])
+    _, send = await start()
+
+    await send("что там о смерти?")
+
+    assert steps.of("gather")[0].question == "что там о смерти?"
+    assert steps.of("summarize")[0].query == "что там о смерти?"

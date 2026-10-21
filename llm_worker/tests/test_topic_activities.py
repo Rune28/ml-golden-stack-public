@@ -1,23 +1,28 @@
 from temporalio.testing import ActivityEnvironment
 
 from rag import topics
-from rag.topics import assemble, cites, lemmas, note_batches, notes_from, render_notes, themes_from
+from rag.topics import assemble, cites, lemmas, note_batches, notes_from, render_notes, similar_from, themes_from
 from workflow.activities import topic as topic_module
 from workflow.activities.topic import TopicSteps
-from workflow.contracts import GatherInput, Source, SummarizeInput
+from workflow.contracts import GatherInput, RouteInput, Source, SummarizeInput
 
 
 class FakeClickHouse:
     """mentions: (term, file_id, index_run_id, chunk_id); themes: (term, file_id, name, chunks)
-    of themes in more than MAX_SHARE of their document's chunks."""
+    of themes in more than MAX_SHARE of their document's chunks; vectors: (term, distance)
+    of the stored terms, the same distance to whatever term is looked up."""
 
-    def __init__(self, mentions=(), themes=(), texts=None):
+    def __init__(self, mentions=(), themes=(), texts=None, vectors=()):
         self.mentions, self.themes, self.texts, self.queries = list(mentions), list(themes), texts or {}, []
+        self.vectors = list(vectors)
 
     def query(self, sql, parameters):
         self.queries.append(sql)
         if "FROM chunk_mentions_current" in sql:
             rows = [m for m in self.mentions if m[0] in parameters["t"]]
+        elif "FROM term_vectors_current" in sql:
+            close = sorted((d, t) for t, d in self.vectors if t != parameters["t"] and d <= parameters["d"])
+            rows = [[t, d] for d, t in close][: parameters["n"]]
         elif "FROM document_themes_current" in sql:
             rows = [t for t in self.themes if t[0] in parameters["t"]]
         elif "FROM files FINAL WHERE" in sql:
@@ -43,10 +48,88 @@ class FakeLLM:
         return self.answers.pop(0) if self.answers else {"answer": "final answer [1]"}
 
 
-def gather(clickhouse, terms, question="q", min_chunks=1):
+def gather(clickhouse, terms, question="q", min_chunks=1, llm=None):
     """By default any number of chunks is a topic: the tests of which chunks are taken use a few."""
-    steps = TopicSteps(lambda: clickhouse, FakeLLM())
+    steps = TopicSteps(lambda: clickhouse, llm or FakeLLM())
     return ActivityEnvironment().run(steps.gather, GatherInput(question=question, terms=terms, min_chunks=min_chunks))
+
+
+def test_route_reads_a_short_query_then_the_kind_and_its_terms():
+    llm = FakeLLM(answers=[{"query": " меняет ли сон человека? ", "kind": "topic", "terms": ["сон", " ", 3]},
+                           {"kind": "fact", "terms": []},
+                           {"kind": "interpret", "query": "как описать этот сон?", "terms": ["сон"]},
+                           {"kind": "topic", "query": "о чём книга?", "terms": []},
+                           {"kind": "story", "query": "q", "terms": ["сон"]}])
+    steps = TopicSteps(lambda: None, llm)
+
+    def route(text):
+        return ActivityEnvironment().run(steps.route, RouteInput(question=text))
+
+    topic, old, story, no_terms, unknown = (route(t) for t in ["Вопрос про сон...", "что такое S3?", "мне снилось...",
+                                                               "о чём книга?", "?"])
+
+    assert (topic.kind, topic.terms, topic.query) == ("topic", ["сон"], "меняет ли сон человека?")
+    # The kind is read off the whole message, the terms off the query.
+    assert list(topics.ROUTE_SCHEMA["properties"]) == ["kind", "query", "terms"]
+    # No query: empty, and the workflow uses the message.
+    assert (old.kind, old.query) == ("fact", "")
+    assert story.kind == "interpret"
+    # A topic needs terms to gather by; a kind not offered is a fact.
+    assert no_terms.kind == "fact" and unknown.kind == "fact"
+
+
+def test_a_term_also_gathers_the_chunks_of_stored_terms_that_name_the_same():
+    # "сон" was a keyword of 3 chunks of a book, "сновидение" of 5 more.
+    clickhouse = FakeClickHouse(
+        mentions=[("сон", "b", "i", 1), ("сновидение", "b", "i", 2), ("мечтание", "b", "i", 3), ("соната", "b", "i", 4)],
+        vectors=[("сновидение", 0.22), ("мечтание", 0.28), ("соната", 0.36)],
+    )
+    llm = FakeLLM(answers=[{"same": ["сновидение", "пробуждение"]}])  # пробуждение: not a candidate
+
+    gathered = gather(clickhouse, ["сон"], question="меняет ли сон человека?", llm=llm)
+
+    assert [s.chunk_id for s in gathered.sources] == [1, 2] and gathered.similar == {"сон": ["сновидение"]}
+    [[prompt]] = llm.prompts
+    assert "«сон»" in prompt["content"] and "меняет ли сон человека?" in prompt["content"]
+    # Candidates are the close terms only, the closest first.
+    assert prompt["content"].endswith("Terms:\nсновидение\nмечтание")
+
+
+def test_similar_terms_count_as_the_term_when_terms_are_intersected():
+    clickhouse = FakeClickHouse(
+        mentions=[("сновидение", "b", "i", 2), ("страх", "b", "i", 2), ("страх", "b", "i", 5)],
+        vectors=[("сновидение", 0.2)],
+    )
+    llm = FakeLLM(answers=[{"same": ["сновидение"]}, {"same": []}])
+
+    gathered = gather(clickhouse, ["сон", "страх"], llm=llm)
+
+    assert [s.chunk_id for s in gathered.sources] == [2] and gathered.similar == {"сон": ["сновидение"]}
+
+
+def test_terms_together_in_too_few_chunks_for_a_topic_give_the_chunks_of_any():
+    mentions = [("сон", "b", "i", n) for n in (1, 2, 3)] + [("страх", "b", "i", n) for n in (2, 3, 7, 8, 9)]
+
+    few = gather(FakeClickHouse(mentions=mentions), ["сон", "страх"], min_chunks=3)
+    enough = gather(FakeClickHouse(mentions=mentions), ["сон", "страх"], min_chunks=2)
+
+    assert [s.chunk_id for s in few.sources] == [1, 2, 3, 7, 8, 9]
+    assert [s.chunk_id for s in enough.sources] == [2, 3]
+
+
+def test_with_no_stored_term_close_to_a_term_the_model_is_not_asked():
+    llm = FakeLLM()
+
+    gathered = gather(FakeClickHouse(mentions=[("сон", "b", "i", 1)], vectors=[("ночь", 0.5)]), ["сон"], llm=llm)
+
+    assert llm.prompts == [] and gathered.similar == {} and gathered.found == 1
+
+
+def test_the_similar_terms_picked_are_candidates_in_their_order():
+    answer = {"same": [" солнце", "пробуждение", "сновидение", "сновидение", 7]}
+
+    assert similar_from(answer, ["сновидение", "солнце", "ночь"]) == ["сновидение", "солнце"]
+    assert similar_from({}, ["сновидение"]) == []
 
 
 def test_the_words_of_a_question_become_stored_terms():
@@ -168,6 +251,22 @@ def test_notes_too_many_for_one_call_are_condensed_first(monkeypatch):
     assert "Merge the notes" in llm.prompts[1][0]["content"] and llm.prompts[1][1]["content"] == f"[1] {'a' * 30}"
     assert llm.prompts[3][0]["content"].endswith("[1] short a\n[2] short b")
     assert generated.text == "**t**\na and b [1]"
+
+
+def test_notes_are_taken_on_the_message_and_themes_named_after_the_query():
+    sources = [Source(file_id="b", index_run_id="i", chunk_id=0, name="book.txt")]
+    llm = FakeLLM(answers=[{"notes": [{"passage": 1, "note": "n"}]}, {"themes": []}, {"paragraph": "p [1]"}])
+
+    generated = ActivityEnvironment().run(
+        TopicSteps(lambda: FakeClickHouse(), llm).summarize,
+        SummarizeInput(question="Вопрос про сон. Сначала ты летишь", sources=sources, query="меняет ли сон?"))
+
+    map_, themes, paragraph = llm.prompts
+    assert "Сначала ты летишь" in map_[0]["content"]
+    assert "меняет ли сон?" in themes[0]["content"] and "летишь" not in themes[0]["content"]
+    # No themes from the model: one, named after the query, never the message.
+    assert "Theme: меняет ли сон?" in paragraph[0]["content"]
+    assert generated.text == "**меняет ли сон?**\np [1]"
 
 
 def test_the_question_never_reaches_the_steps_that_write_from_notes(monkeypatch):

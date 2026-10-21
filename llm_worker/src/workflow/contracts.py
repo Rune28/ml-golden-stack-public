@@ -153,9 +153,14 @@ class RouteInput:
 
 @dataclass
 class Route:
-    kind: str = "fact"  # fact | topic
-    # The words of the message that name the topic.
+    # fact | topic | interpret (the user's own story: answered as a fact).
+    kind: str = "fact"
+    # The words of the query that name the topic.
     terms: list[str] = field(default_factory=list)
+    # What the message asks of the documents, short, without the story
+    # around it: what a topic is gathered and themed by. Empty from a route
+    # before it existed: the message is used then.
+    query: str = ""
 
 
 @dataclass
@@ -186,9 +191,16 @@ class Gathered:
     found: int = 0
     broad: list[Broad] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
+    # The stored terms close to each term that were taken with it (сон →
+    # [сновидение]), so the choice is in the workflow history.
+    similar: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
 class SummarizeInput:
+    # The message as written: the notes are taken on what it asks.
     question: str
     sources: list[Source]
+    # The short query of the route: themes are named after it, not after the
+    # story of a long message. Empty: the question.
+    query: str = ""

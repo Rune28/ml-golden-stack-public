@@ -26,21 +26,75 @@ MIN_CHUNKS = 6
 # Chunks per call of the map step: they fit the context of a small model.
 GROUP = 6
 
+# Kinds of a message: topic is gathered from every chunk of its terms and
+# summarized; fact and interpret are answered from the chunks closest to the
+# message as written. interpret is a fact by its path but a kind of its own:
+# told "fact otherwise, and any story of the user's", the model sent every
+# dream to a topic, 20 of 20; given three kinds, it sent each where it
+# belongs. A dream through a topic came back an overview of the book that
+# never saw the question ("Математическое описание сна"); through the closest
+# chunks, an answer about that dream.
+KINDS = ("fact", "topic", "interpret")
+
+# The model writes the fields in this order. The kind first, off the whole
+# message: written after the query, it was read off a short question and a
+# dream went the other way 3 times of 5. Then the query, then the terms off
+# the query, not off the story. Without the examples and "in Russian", the
+# query came in English 4 times of 6, and the terms named only the author
+# ("Пруст", a theme of the whole book: too broad to gather). Measured on
+# qwen3:4b, 2026-10-21: five messages about the user's dreams and seven
+# control questions, each kind right 5 times of 5.
 ROUTE_SCHEMA = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["fact", "topic"]},
+        "kind": {"type": "string", "enum": list(KINDS)},
+        "query": {"type": "string"},
         "terms": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
     },
-    "required": ["kind", "terms"],
+    "required": ["kind", "query", "terms"],
 }
 
 ROUTE_PROMPT = """You decide how to answer a message about the user's documents. Return JSON.
-- kind: topic when the message asks to gather what the documents say about a subject across many
-  passages: what someone meant, what is said about something, an overview, everything about it.
-  fact when a few passages answer it: a definition, a detail, a specific question.
-- terms: for a topic, the words that name the subject, as written in the message (names and nouns,
-  at most 3); for a fact, an empty list."""
+- kind, one of three:
+  interpret: the user tells their own story, dream, experience or thought and asks what it means or how to
+  understand it ("как бы ты описал этот сон? мне снилось, что…", "то есть во сне отыгрывается страх?").
+  topic: the user asks what the documents or an author say about a subject, gathered from many passages
+  ("что Пруст говорит о смерти?", "что автор имел в виду под топологией пути?", "как Мамардашвили понимает любовь?").
+  fact: a definition, a name, a date, a detail ("что такое трансмировая линия?", "кто автор книги?").
+- query: what the message asks of the documents, as one short question in the language of the message
+  (a message in Russian gets a query in Russian), at most 20 words: the subject and what is asked about it,
+  without the story or the examples around it.
+- terms: at most 3 words of the query, as written there: the subject asked about first (смерть, любовь,
+  сон), then a name or a word that narrows it (Пруст). Never only a name: "что Пруст говорит о смерти?"
+  gives смерти, Пруст."""
+
+# A term of the question also gathers the stored terms close to it: "сон" is a
+# keyword of 3 chunks of a book, "сновидение" of 5 more. The closest are
+# candidates and the chat model picks the ones that name the same subject.
+SIMILAR_CANDIDATES = 15
+# Cosine distance (1 - similarity) of bge-m3; farther terms are not even
+# candidates. The model let through what was close enough to be offered: at
+# 0.4, сон → соната (0.36), просыпание (0.33), бодрствование (0.38) and
+# транссибирская магистраль → трансмировая линия (0.34). Synonyms measured
+# within 0.3: сон → сновидение 0.22, мечтание 0.28; личность → индивидуальность
+# 0.23; изменение → преобразование 0.25; страх → ужас 0.28. Lost: изменение →
+# превращение 0.32.
+SIMILAR_MAX_DISTANCE = 0.3
+
+SIMILAR_SCHEMA = {
+    "type": "object",
+    "properties": {"same": {"type": "array", "items": {"type": "string"}}},
+    "required": ["same"],
+}
+
+SIMILAR_PROMPT = """The user asks about a subject named by the term «{term}». Question: {query}
+Below are terms found in the user's documents. Return the ones that name the same subject: a synonym,
+another form of the word, or a kind of it (for «сон»: сновидение, тяжёлый сон). Leave out terms that are
+only related to it (for «сон»: пробуждение, ночь), that sound alike, or that name something else.
+Return the terms exactly as written; an empty list if none.
+
+Terms:
+{candidates}"""
 
 # Map and reduce answer in JSON: a schema makes the model write the answer
 # from its first token, so qwen3 does not think first. In free text it
@@ -128,6 +182,13 @@ def lemmas(term: str) -> str | None:
     линий" → трансмировая линия (the longest candidate: the whole phrase)."""
     found = candidates(term)
     return max(found, key=lambda t: (len(t.split()), len(t))) if found else None
+
+
+def similar_from(answer: dict, candidates: list[str]) -> list[str]:
+    """The terms the model picked, checked: only candidates it was given, in
+    their order, once each."""
+    picked = {t.strip() for t in answer.get("same") or [] if isinstance(t, str)}
+    return [c for c in candidates if c in picked]
 
 
 def groups(items: list, size: int = GROUP) -> list[list]:

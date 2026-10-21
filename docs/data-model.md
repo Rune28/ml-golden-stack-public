@@ -57,11 +57,13 @@ erDiagram
     files ||--o{ document_themes : "file_id"
     sat_document ||--o{ link_document_author : "run_id of the document run"
     doc_chunks ||--o{ chunk_mentions : "index_run_id + chunk_id"
+    chunk_mentions ||--|| term_vectors : "term, the same mentions run"
     doc_chunks ||--o{ chat_messages : "sources = file_id, index_run_id, chunk_id"
 
     runs ||--|{ doc_chunks : "kind=index"
     runs ||--|{ sat_document : "kind=document"
     runs ||--|{ chunk_mentions : "kind=mentions"
+    runs ||--|{ term_vectors : "kind=mentions"
     runs ||--|{ chat_messages : "kind=answer"
 
     pg_users {
@@ -125,6 +127,13 @@ erDiagram
         UInt8 rank "1 to 5 within the chunk"
         Float32 score
     }
+    term_vectors {
+        String run_id PK "the same mentions run"
+        String term PK "one row per term and run"
+        String file_id
+        String embed_model
+        Array_Float32 embedding "unit length"
+    }
     document_themes {
         String run_id PK "the same mentions run"
         String file_id
@@ -153,6 +162,7 @@ flowchart LR
         sd[sat_document]
         la[link_document_author]
         cm[chunk_mentions]
+        tv[term_vectors]
         dt[document_themes]
         msg[chat_messages]
     end
@@ -161,6 +171,7 @@ flowchart LR
         sdc[sat_document_current]
         lac[link_document_author_current]
         cmc[chunk_mentions_current]
+        tvc[term_vectors_current]
         dtc[document_themes_current]
         mc[chat_messages_committed]
     end
@@ -191,6 +202,7 @@ flowchart LR
     la --> lac --> lav
     lac --> ha
     cm --> cmc --> cmv
+    tv --> tvc
     dt --> dtc --> dtv
     msg --> mc --> mv
 

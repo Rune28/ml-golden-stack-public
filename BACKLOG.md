@@ -7,8 +7,12 @@ Documents, authors and concepts as Data Vault hubs with links, so a question abo
 - [x] S5 Documents: PDF, `sat_document`, `link_document_author`, hub views, activity `read_document` in `Index`
 - [x] S6a Keywords at upload: activity `extract_mentions` (TF-IDF within the document + bge-m3, no LLM), `chunk_mentions`, `document_themes`
 - [x] S7 Questions about a topic in `Chat`: `route`, `gather`, `summarize` (map → themes → a paragraph per theme)
-- [ ] S6b Concept graph: Job `build_concepts` over the corpus: canonical terms, `broader` hierarchy, aliases, `concept_ancestors`, one run per graph
+- [x] S6b-1 Similar terms at question time: `route` tells a fact, a topic and the user's own story to `interpret` (answered as a fact, from the chunks closest to the message) and reads a short `query` a topic is gathered and themed by; `extract_mentions` keeps the vectors of its keywords (`term_vectors`); `gather` takes with each term the stored terms closest by vector that the chat model picks as the same subject ("сон" → сновидение)
+- [ ] S6b Concept graph: Job `build_concepts` over the corpus, from `term_vectors`: canonical terms, `broader` hierarchy, stored aliases (then `gather` reads them instead of asking the model per question), `concept_ancestors`, one run per graph
 - [ ] Index runs replaced by a newer one are never deleted: every `reindex-all` keeps another copy of the chunks (readers do not see them)
+- [ ] A paragraph of a topic answer is sometimes in English when its notes are in Russian: 2 of 11 paragraphs over the notes of a book in Russian (2026-10-21)
+- [ ] A paragraph is sometimes the instructions retold ("Нужно написать один абзац…", "This is an example paragraph…") and passes `cites`, because it cites a passage of its theme too
+- [ ] A paragraph cites passages outside its theme or numbers that are no passage (`[3]`, `[2.1]`): `cites` only asks for one citation of the theme, the others are kept
 
 ## Next: login and per-user data
 

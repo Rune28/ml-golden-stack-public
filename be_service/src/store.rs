@@ -299,9 +299,9 @@ impl ClickHouse {
     }
 
     /// What runs other than the index made from a file: the document and its
-    /// authors, the keywords of its chunks and its themes.
+    /// authors, the keywords of its chunks, their vectors and its themes.
     pub async fn delete_derived(&self, file_id: &str) -> Result<()> {
-        for table in ["sat_document", "link_document_author", "chunk_mentions", "document_themes"] {
+        for table in ["sat_document", "link_document_author", "chunk_mentions", "term_vectors", "document_themes"] {
             self.client.query(&format!("DELETE FROM {table} WHERE file_id = ?")).bind(file_id).execute().await?;
         }
         Ok(())

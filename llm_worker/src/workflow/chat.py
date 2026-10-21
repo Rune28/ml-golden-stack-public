@@ -1,9 +1,12 @@
 """Chat: one conversation, an entity workflow with the ID chat-<chat_id>.
 
 A message is an Update: the caller (be_service) waits for its result, the
-answer. A message about a fact is answered from the chunks closest to it
-(retrieve, generate); a message about a topic from every chunk the topic is
-a keyword of (route, gather, summarize: map-reduce). The first message starts the workflow in the same call
+answer. route tells what kind of message it is. A message about a fact,
+or the user's own story to interpret, is answered from the chunks closest
+to the message as written (retrieve, generate): the story is what finds
+the passages about it. A message about a topic is answered from every chunk
+the topic is a keyword of (gather, summarize: map-reduce), gathered and
+themed by the short query route reads from it. The first message starts the workflow in the same call
 (UpdateWithStart). Between messages the workflow only waits, and a waiting
 workflow costs the worker nothing.
 
@@ -75,7 +78,9 @@ class ChatWorkflow:
         async with self.lock:
             # Topics came after the first release: chats started before
             # replay without them (principle 6).
-            topic = await self.topic(message) if workflow.patched("topics") else None
+            route = await self.route(message) if workflow.patched("topics") else Route()
+            # A fact and a story to interpret (route.kind interpret) take the same path.
+            topic = await self.topic(message, route) if route.kind == "topic" else None
             if topic:
                 generated, sources = topic
             else:
@@ -97,8 +102,16 @@ class ChatWorkflow:
             return Answer(run_id=message.run_id, turn=turn, text=generated.text, sources=sources,
                           model=generated.model)
 
+    async def route(self, message: MessageInput) -> Route:
+        return await workflow.execute_activity(
+            ROUTE, RouteInput(question=message.text), result_type=Route,
+            start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
+        )
+
     async def fact(self, message: MessageInput) -> tuple[Generated, list[Source]]:
-        """From the chunks closest to the question."""
+        """From the chunks closest to the message. Not to its short query: the
+        query of a dream retold was "как бы ты описал этот сон?", and only the
+        story found the passages on dreams of cities and houses."""
         sources = await workflow.execute_activity(
             RETRIEVE,
             RetrieveInput(question=message.text),
@@ -116,17 +129,14 @@ class ChatWorkflow:
         )
         return generated, sources
 
-    async def topic(self, message: MessageInput) -> tuple[Generated, list[Source]] | None:
-        """From every chunk the topic is a keyword of; None when the message is
-        about a fact or its words name nothing stored."""
-        route = await workflow.execute_activity(
-            ROUTE, RouteInput(question=message.text), result_type=Route,
-            start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
-        )
-        if route.kind != "topic":
-            return None
+    async def topic(self, message: MessageInput, route: Route) -> tuple[Generated, list[Source]] | None:
+        """From every chunk the topic is a keyword of; None when its words
+        name nothing stored. Gathered and themed by the short query (the
+        message from a route before the query existed), the notes taken on
+        what the message asks."""
+        query = route.query or message.text
         gathered = await workflow.execute_activity(
-            GATHER, GatherInput(question=message.text, terms=route.terms, max_chunks=self.max_topic_chunks,
+            GATHER, GatherInput(question=query, terms=route.terms, max_chunks=self.max_topic_chunks,
                                 min_chunks=self.min_topic_chunks),
             result_type=Gathered,
             start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
@@ -137,7 +147,8 @@ class ChatWorkflow:
         if gathered.mode != "chunks":
             return None
         generated = await workflow.execute_activity(
-            SUMMARIZE, SummarizeInput(question=message.text, sources=gathered.sources), result_type=Generated,
+            SUMMARIZE, SummarizeInput(question=message.text, sources=gathered.sources, query=query),
+            result_type=Generated,
             # A call per group of chunks, one for the themes, one per theme: two or three minutes.
             start_to_close_timeout=timedelta(minutes=15), heartbeat_timeout=timedelta(minutes=2),
             retry_policy=RETRY,

@@ -2,10 +2,15 @@
 
 Stream work (README, rule 12), blocking, on the worker's thread pool.
 
-- route asks the chat model whether a message is about a fact or a topic,
-  and which words name the topic.
-- gather turns those words into stored terms (rag.topics.lemmas) and finds
-  the chunks: a term in the keywords of chunks (chunk_mentions_current) is
+- route asks the chat model whether a message is about a fact, a topic, or
+  the user's own story to interpret (answered as a fact), what it asks of
+  the documents as a short query, and which words of the query name the
+  topic.
+- gather turns those words into stored terms (rag.topics.lemmas), takes
+  with each the stored terms that name the same subject (the closest by
+  vector in term_vectors_current, picked by the chat model) and finds the
+  chunks: a term in the keywords of chunks (chunk_mentions_current), its
+  own or a similar one's, is
   selective and gives its chunks; a term that is only a theme of whole
   documents (document_themes_current, in more than MAX_SHARE of their
   chunks, so never a keyword of one chunk) narrows the documents. Only
@@ -26,6 +31,7 @@ from temporalio import activity
 from rag.mentions import MAX_SHARE
 from rag.topics import (
     CONDENSE_PROMPT,
+    KINDS,
     MAP_PROMPT,
     MAP_SCHEMA,
     MAX_NOTES_CHARS,
@@ -33,6 +39,10 @@ from rag.topics import (
     PARAGRAPH_SCHEMA,
     ROUTE_PROMPT,
     ROUTE_SCHEMA,
+    SIMILAR_CANDIDATES,
+    SIMILAR_MAX_DISTANCE,
+    SIMILAR_PROMPT,
+    SIMILAR_SCHEMA,
     THEMES_PROMPT,
     THEMES_SCHEMA,
     assemble,
@@ -42,6 +52,7 @@ from rag.topics import (
     note_batches,
     notes_from,
     render_notes,
+    similar_from,
     themes_from,
 )
 from workflow.activities.index import connect
@@ -66,8 +77,11 @@ class TopicSteps:
             [{"role": "system", "content": ROUTE_PROMPT}, {"role": "user", "content": input.question}], ROUTE_SCHEMA
         )
         terms = [t.strip() for t in answer.get("terms") or [] if isinstance(t, str) and t.strip()][:3]
-        kind = "topic" if answer.get("kind") == "topic" and terms else "fact"
-        return Route(kind=kind, terms=terms)
+        kind = answer.get("kind")
+        if kind not in KINDS or (kind == "topic" and not terms):
+            kind = "fact"
+        query = answer.get("query")
+        return Route(kind=kind, terms=terms, query=query.strip() if isinstance(query, str) else "")
 
     @activity.defn(name="gather")
     def gather(self, input: GatherInput) -> Gathered:
@@ -75,13 +89,19 @@ class TopicSteps:
         if not stored:
             return Gathered(mode="none")
         client = self.connect()
+        similar = {t: self.similar(client, t, input.question) for t in stored}
 
-        chunks: dict[str, set[tuple[str, str, int]]] = {}
+        # The chunks of a term: those its own or a similar term is a keyword of.
+        variants = {t: [t, *similar[t]] for t in stored}
+        by_variant: dict[str, set[tuple[str, str, int]]] = {}
         for term, file_id, index_run_id, chunk_id in client.query(
             "SELECT term, file_id, index_run_id, chunk_id FROM chunk_mentions_current WHERE term IN {t:Array(String)}",
-            parameters={"t": stored},
+            parameters={"t": sorted({v for vs in variants.values() for v in vs})},
         ).result_rows:
-            chunks.setdefault(term, set()).add((file_id, index_run_id, chunk_id))
+            by_variant.setdefault(term, set()).add((file_id, index_run_id, chunk_id))
+        chunks = {t: set().union(*(by_variant.get(v, set()) for v in vs)) for t, vs in variants.items()}
+        chunks = {t: found for t, found in chunks.items() if found}
+        similar = {t: s for t, s in similar.items() if s}
         broad = [
             Broad(term=t, file_id=f, name=n, chunks=c)
             for t, f, n, c in client.query(
@@ -97,18 +117,22 @@ class TopicSteps:
         if not chunks:
             # Every term a theme of whole documents: too broad. Otherwise a
             # word that names nothing stored: answer the question as a fact.
-            return Gathered(mode="too_broad", terms=stored, broad=broad) if broad and not unknown else Gathered(
-                mode="none", terms=stored)
+            return Gathered(mode="too_broad", terms=stored, broad=broad, similar=similar) if broad and not unknown \
+                else Gathered(mode="none", terms=stored, similar=similar)
 
+        # The chunks of all the terms when they are enough for a topic, else
+        # of any: сон and страх were keywords of 2 chunks together, of 23 apart,
+        # and 2 sent the question to a fact.
         sets = list(chunks.values())
-        found = set.intersection(*sets) or set.union(*sets)
+        both = set.intersection(*sets)
+        found = both if len(both) >= input.min_chunks else set.union(*sets)
         if broad_terms:
             files = {b.file_id for b in broad if b.term in broad_terms}
             found = {c for c in found if c[0] in files} or found
         if len(found) < input.min_chunks:
             # Too few for a topic: the chunks closest to the question say more.
-            log.info("topic %s: %d chunks found, answered as a fact", stored, len(found))
-            return Gathered(mode="none", terms=stored, found=len(found))
+            log.info("topic %s (similar %s): %d chunks found, answered as a fact", stored, similar, len(found))
+            return Gathered(mode="none", terms=stored, found=len(found), similar=similar)
         keys = sorted(found)
         if len(keys) > input.max_chunks:
             keys = self.closest(client, input.question, keys, input.max_chunks)
@@ -116,11 +140,28 @@ class TopicSteps:
             "SELECT file_id, name FROM files FINAL WHERE file_id IN {f:Array(String)}",
             parameters={"f": sorted({k[0] for k in keys})},
         ).result_rows)
-        log.info("topic %s: %d chunks found, %d taken", stored, len(found), len(keys))
+        log.info("topic %s (similar %s): %d chunks found, %d taken", stored, similar, len(found), len(keys))
         return Gathered(
-            mode="chunks", terms=stored, found=len(found), broad=broad,
+            mode="chunks", terms=stored, found=len(found), broad=broad, similar=similar,
             sources=[Source(file_id=f, index_run_id=r, chunk_id=c, name=names.get(f, "")) for f, r, c in keys],
         )
+
+    def similar(self, client, term: str, query: str) -> list[str]:
+        """The stored terms that name what `term` does, other than itself: the
+        closest by vector are the candidates, the chat model picks. Nothing
+        stored close to it (or no vectors yet): no call to the model."""
+        [vector] = self.llm.embed([term])
+        candidates = [t for t, _ in client.query(
+            "SELECT term, min(cosineDistance(embedding, {q:Array(Float32)})) AS distance FROM term_vectors_current "
+            "WHERE embed_model = {m:String} AND term != {t:String} GROUP BY term HAVING distance <= {d:Float32} "
+            "ORDER BY distance LIMIT {n:UInt32}",
+            parameters={"q": vector, "m": self.llm.embed_model, "t": term, "d": SIMILAR_MAX_DISTANCE,
+                        "n": SIMILAR_CANDIDATES},
+        ).result_rows]
+        if not candidates:
+            return []
+        prompt = SIMILAR_PROMPT.format(term=term, query=query, candidates="\n".join(candidates))
+        return similar_from(self.llm.chat_json([{"role": "user", "content": prompt}], SIMILAR_SCHEMA), candidates)
 
     def closest(self, client, question: str, keys: list[tuple[str, str, int]], n: int) -> list[tuple[str, str, int]]:
         """The n keys closest to the question, in the order of the text."""
@@ -167,10 +208,14 @@ class TopicSteps:
                 break  # no shorter: render_notes cuts at the limit instead
             notes = condensed
 
+        # Themes are named after the short query: named after a long message,
+        # they were its story ("Сон как процесс усвоения страха").
+        query = input.query or q
         passages = {p for p, _ in notes}
-        themes = themes_from(ask(THEMES_PROMPT.format(question=q, notes=render_notes(notes)), THEMES_SCHEMA), passages)
+        themes = themes_from(ask(THEMES_PROMPT.format(question=query, notes=render_notes(notes)), THEMES_SCHEMA),
+                             passages)
         if not themes:
-            themes = [(q, sorted(passages))]
+            themes = [(query, sorted(passages))]
         paragraphs = []
         for theme, mine in themes:
             text = render_notes([n for n in notes if n[0] in mine])
