@@ -13,13 +13,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::auth::{User, Verifier};
 use crate::files::{self, ObjectStore};
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
 use crate::store::{
     Batch, ChatSummary, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, DocumentRow, PredictionRun, Stats,
-    StoredFile,
 };
 use crate::temporal::{LLM_QUEUE, Pipeline, StartError, Started, Status, Temporal, UpdateError};
 
@@ -37,6 +37,8 @@ pub struct AppState {
     /// same examples. Enough while be_service runs one replica.
     pub ingest_lock: Mutex<()>,
     pub objects: ObjectStore,
+    /// Checks the platform token of the product routes (files, documents, chats).
+    pub verifier: Verifier,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -191,58 +193,77 @@ struct Uploaded {
 
 /// Upload a text file: `POST /api/files?name=notes.md` with the file as the
 /// body. The bytes go to the object store, then a row to `files`, then the
-/// Index workflow starts. file_id is the sha256 of the bytes, so the same
-/// bytes uploaded again, by a retry or by another replica at the same moment,
-/// are the same file: stored once, indexed once.
+/// user's link to it, then the Index workflow starts. file_id is the sha256
+/// of the bytes, so the same bytes uploaded again, by a retry, by another
+/// replica at the same moment or by another user, are the same file: stored
+/// once, indexed once.
+///
+/// `duplicate` is about the user's own files only. Bytes another user has
+/// get the user's link and no second index, and the answer reads as a new
+/// upload: an upload does not tell anyone what others have. What still
+/// shows is the time: such a file is indexed at once (docs/auth-plan.md).
 async fn upload_file(
     State(state): State<Arc<AppState>>,
+    User(user): User,
     Query(q): Query<UploadQuery>,
     body: Bytes,
 ) -> Result<Json<Uploaded>, ApiError> {
     files::validate(&q.name, &body).map_err(ApiError::BadRequest)?;
     let file_id = files::sha256_hex(&body);
+    let size = body.len() as u64;
 
-    if let Some(existing) = state.store.file(&file_id).await? {
-        let StoredFile { file_id, name, size } = existing;
-        return Ok(Json(Uploaded { file_id, name, size, duplicate: true, index: None }));
+    if let Some(mine) = state.store.visible(&user).file(&file_id).await? {
+        return Ok(Json(Uploaded { file_id, name: mine.name, size: mine.size, duplicate: true, index: None }));
+    }
+    if state.store.stored_file(&file_id).await?.is_some() {
+        state.store.add_owner(&user, &file_id, &q.name).await?;
+        tracing::info!(%file_id, %user, "file linked to another owner");
+        return Ok(Json(Uploaded { file_id, name: q.name, size, duplicate: false, index: None }));
     }
     // Two uploads of the same bytes at once both get here. They write the
     // same object and the same row (the duplicate merges away), and Temporal
     // lets only one of them start the index.
     let object_key = files::object_key(&file_id);
-    let size = body.len() as u64;
     state.objects.put(&object_key, body).await?;
     state.store.insert_file(&file_id, &q.name, size, &object_key).await?;
+    state.store.add_owner(&user, &file_id, &q.name).await?;
 
-    tracing::info!(%file_id, name = %q.name, size, "file uploaded");
+    tracing::info!(%file_id, %user, name = %q.name, size, "file uploaded");
     let index = match start_index(&state, &file_id).await {
         Ok(started) => Some(started),
         // The other upload of these bytes started it.
         Err(ApiError::Conflict(_)) => None,
         Err(e) => return Err(e),
     };
-    Ok(Json(Uploaded { file_id, name: q.name, size, duplicate: index.is_none(), index }))
+    Ok(Json(Uploaded { file_id, name: q.name, size, duplicate: false, index }))
 }
 
 /// Index a file again: after a failed index, or with a new embedding model.
 async fn index_file(
     State(state): State<Arc<AppState>>,
+    User(user): User,
     Path(file_id): Path<String>,
 ) -> Result<Json<Started>, ApiError> {
     let file_id = validate_run_id("file_id", file_id)?;
-    if state.store.file(&file_id).await?.is_none() {
+    if state.store.visible(&user).file(&file_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("no file {file_id}")));
     }
     Ok(Json(start_index(&state, &file_id).await?))
 }
 
-/// Delete a file and everything made from it: `DELETE /api/files/<file_id>`.
-/// Refused while the file is being indexed: an index committed after the
-/// deletion would bring its chunks back (retrieval also skips chunks of
-/// files that are gone). A call retried after a failure finishes the job.
-async fn delete_file(State(state): State<Arc<AppState>>, Path(file_id): Path<String>) -> Result<Json<Value>, ApiError> {
+/// A user deletes their file: `DELETE /api/files/<file_id>`. Their link to
+/// it goes; the file and everything made from it go when no other user has
+/// it (files::remove). Refused while the file is being indexed: an index
+/// committed after the deletion would bring its chunks back (retrieval also
+/// skips chunks of files that are gone). A file of someone else is a 404,
+/// as one that does not exist. A call retried after a failure finishes the job.
+async fn delete_file(
+    State(state): State<Arc<AppState>>,
+    User(user): User,
+    Path(file_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
     let file_id = validate_run_id("file_id", file_id)?;
-    if state.store.file(&file_id).await?.is_none() {
+    if state.store.visible(&user).file(&file_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("no file {file_id}")));
     }
     // Temporal unreachable is an error, not "not indexing": no deletion on a guess.
@@ -251,8 +272,9 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(file_id): Path<Str
     {
         return Err(ApiError::Conflict(format!("file {file_id} is being indexed: delete it when that is done")));
     }
-    files::delete(&files::Stores { store: &state.store, objects: &state.objects }, &file_id).await?;
-    tracing::info!(%file_id, "file deleted");
+    let stores = files::Stores { store: &state.store, objects: &state.objects };
+    let gone = files::remove(&stores, &stores, &user, &file_id).await?;
+    tracing::info!(%file_id, %user, gone, "file deleted for a user");
     Ok(Json(json!({ "file_id": file_id, "deleted": true })))
 }
 
@@ -289,8 +311,8 @@ struct FileView {
 
 /// Uploaded files with the state of their index: committed chunks from the
 /// run registry, and for a file without them, its Index workflow.
-async fn list_files(State(state): State<Arc<AppState>>) -> Result<Json<Vec<FileView>>, ApiError> {
-    let rows = state.store.files(100).await?;
+async fn list_files(State(state): State<Arc<AppState>>, User(user): User) -> Result<Json<Vec<FileView>>, ApiError> {
+    let rows = state.store.visible(&user).files(100).await?;
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
         let (status, error) = if row.chunks > 0 {
@@ -338,9 +360,10 @@ fn default_top_themes() -> u32 {
 /// version of a paper are one document with two files.
 async fn list_documents(
     State(state): State<Arc<AppState>>,
+    User(user): User,
     Query(q): Query<DocumentsQuery>,
 ) -> Result<Json<Vec<DocumentRow>>, ApiError> {
-    Ok(Json(state.store.documents(100, q.top.min(100)).await?))
+    Ok(Json(state.store.visible(&user).documents(100, q.top.min(100)).await?))
 }
 
 #[derive(Serialize)]
@@ -348,15 +371,17 @@ struct NewChat {
     chat_id: String,
 }
 
-/// A new conversation: only its id, made here. The Chat workflow starts with
-/// the first message.
-async fn new_chat() -> Json<NewChat> {
-    Json(NewChat { chat_id: uuid::Uuid::now_v7().to_string() })
+/// A new conversation: its id, made here, and the user's link to it. The
+/// Chat workflow starts with the first message.
+async fn new_chat(State(state): State<Arc<AppState>>, User(user): User) -> Result<Json<NewChat>, ApiError> {
+    let chat_id = uuid::Uuid::now_v7().to_string();
+    state.store.add_chat_owner(&user, &chat_id).await?;
+    Ok(Json(NewChat { chat_id }))
 }
 
-/// The conversations, the latest first, for the chat page to go back to one.
-async fn list_chats(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ChatSummary>>, ApiError> {
-    Ok(Json(state.store.chats(50).await?))
+/// The user's conversations, the latest first, for the chat page to go back to one.
+async fn list_chats(State(state): State<Arc<AppState>>, User(user): User) -> Result<Json<Vec<ChatSummary>>, ApiError> {
+    Ok(Json(state.store.visible(&user).chats(50).await?))
 }
 
 #[derive(Serialize)]
@@ -380,17 +405,23 @@ struct MessageView {
 /// opens one. A chat with no committed turn yet has none.
 async fn chat_history(
     State(state): State<Arc<AppState>>,
+    User(user): User,
     Path(chat_id): Path<String>,
 ) -> Result<Json<Vec<MessageView>>, ApiError> {
     let chat_id = validate_run_id("chat_id", chat_id)?;
-    let rows = state.store.chat_messages(&chat_id).await?;
+    let visible = state.store.visible(&user);
+    if !visible.owns_chat(&chat_id).await? {
+        return Err(ApiError::NotFound(format!("no chat {chat_id}")));
+    }
+    let rows = visible.chat_messages(&chat_id).await?;
     let file_ids: Vec<String> = rows
         .iter()
         .flat_map(|r| r.sources.iter().map(|(f, _, _)| f.clone()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let names = if file_ids.is_empty() { Default::default() } else { state.store.file_names(&file_ids).await? };
+    // A source the user no longer has (deleted since) shows without a name.
+    let names = if file_ids.is_empty() { Default::default() } else { visible.file_names(&file_ids).await? };
     let messages = rows
         .into_iter()
         .map(|r| MessageView {
@@ -420,8 +451,13 @@ struct MessageRequest {
 /// One message of a chat, answered from the uploaded files:
 /// `POST /api/chats/<chat_id>/messages` with `{"text": "..."}`. Waits for the
 /// answer: seconds to a minute for a small model on the local GPU.
+///
+/// The chat must be the user's. The user_id goes with the message to the
+/// workflow, and every step of the answer reads only the user's files with
+/// it: the workflow itself keeps no identity.
 async fn send_message(
     State(state): State<Arc<AppState>>,
+    User(user): User,
     Path(chat_id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -430,9 +466,12 @@ async fn send_message(
     if text.is_empty() || text.chars().count() > MAX_MESSAGE_CHARS {
         return Err(ApiError::BadRequest(format!("text: 1-{MAX_MESSAGE_CHARS} characters")));
     }
+    if !state.store.visible(&user).owns_chat(&chat_id).await? {
+        return Err(ApiError::NotFound(format!("no chat {chat_id}")));
+    }
     // The answer's run, made where the request enters the platform (principle 5).
     let run_id = uuid::Uuid::now_v7().to_string();
-    match state.temporal.send_message(&chat_id, &run_id, text).await {
+    match state.temporal.send_message(&chat_id, &run_id, text, &user).await {
         Ok(answer) => Ok(Json(answer)),
         Err(UpdateError::Failed(message)) => Err(ApiError::Upstream(message)),
         Err(UpdateError::Other(e)) => Err(ApiError::Internal(e)),
@@ -578,6 +617,8 @@ fn validate_run_id(field: &str, id: String) -> Result<String, ApiError> {
 
 pub enum ApiError {
     BadRequest(String),
+    /// No valid platform token: the product routes are for a user.
+    Unauthorized(String),
     NotFound(String),
     Conflict(String),
     /// A workflow behind the API failed: the message is its error.
@@ -604,6 +645,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
@@ -633,7 +675,13 @@ mod tests {
             mlflow: Mlflow::new("http://127.0.0.1:9".into()),
             ingest_lock: Mutex::default(),
             objects: ObjectStore::new("http://127.0.0.1:9", "pipeline", "key", "secret").unwrap(),
+            verifier: Verifier::from_pem(crate::auth::tests::PUBLIC).unwrap(),
         }))
+    }
+
+    /// The header of a valid platform token of a user.
+    fn bearer() -> String {
+        format!("Bearer {}", crate::auth::tests::token(crate::auth::tests::USER))
     }
 
     async fn post(body: &str) -> StatusCode {
@@ -652,7 +700,10 @@ mod tests {
     }
 
     async fn upload(name: &str, body: &'static [u8]) -> StatusCode {
-        let req = Request::post(format!("/api/files?name={name}")).body(Body::from(body)).unwrap();
+        let req = Request::post(format!("/api/files?name={name}"))
+            .header("authorization", bearer())
+            .body(Body::from(body))
+            .unwrap();
         app().oneshot(req).await.unwrap().status()
     }
 
@@ -661,12 +712,13 @@ mod tests {
         assert_eq!(upload("photo.png", b"x").await, StatusCode::BAD_REQUEST);
         assert_eq!(upload("empty.md", b"").await, StatusCode::BAD_REQUEST);
         assert_eq!(upload("binary.txt", &[0xff, 0xfe]).await, StatusCode::BAD_REQUEST);
-        let no_name = Request::post("/api/files").body(Body::from("text")).unwrap();
+        let no_name = Request::post("/api/files").header("authorization", bearer()).body(Body::from("text")).unwrap();
         assert_eq!(app().oneshot(no_name).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     async fn message(chat_id: &str, body: &str) -> StatusCode {
         let req = Request::post(format!("/api/chats/{chat_id}/messages"))
+            .header("authorization", bearer())
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()));
         app().oneshot(req.unwrap()).await.unwrap().status()
@@ -683,23 +735,46 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_a_malformed_file_id_before_any_lookup() {
-        let req = Request::delete("/api/files/a%20b").body(Body::empty()).unwrap();
+        let req = Request::delete("/api/files/a%20b").header("authorization", bearer()).body(Body::empty()).unwrap();
         assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn refuses_a_malformed_chat_id_before_reading_history() {
-        let req = Request::get("/api/chats/a%20b/messages").body(Body::empty()).unwrap();
+        let req =
+            Request::get("/api/chats/a%20b/messages").header("authorization", bearer()).body(Body::empty()).unwrap();
         assert_eq!(app().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn a_new_chat_gets_a_uuid() {
-        let res = app().oneshot(Request::post("/api/chats").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
-        let chat: Value = serde_json::from_slice(&body).unwrap();
-        assert!(uuid::Uuid::parse_str(chat["chat_id"].as_str().unwrap()).is_ok());
+    async fn the_product_routes_need_a_valid_token_before_anything_is_read() {
+        let expired = crate::auth::tests::token_with(
+            crate::auth::tests::PRIVATE,
+            crate::auth::tests::USER,
+            crate::auth::AUDIENCE,
+            crate::auth::ISSUER,
+            -120,
+        );
+        for (method, path) in [
+            ("GET", "/api/files"),
+            ("POST", "/api/files?name=a.md"),
+            ("DELETE", "/api/files/abc"),
+            ("POST", "/api/files/abc/index"),
+            ("GET", "/api/documents"),
+            ("GET", "/api/chats"),
+            ("POST", "/api/chats"),
+            ("GET", "/api/chats/c-1/messages"),
+            ("POST", "/api/chats/c-1/messages"),
+        ] {
+            for auth in [None, Some("Bearer not-a-token".to_owned()), Some(format!("Bearer {expired}"))] {
+                let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");
+                if let Some(auth) = &auth {
+                    req = req.header("authorization", auth);
+                }
+                let res = app().oneshot(req.body(Body::from(r#"{"text": "hi"}"#)).unwrap()).await.unwrap();
+                assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path} with {auth:?}");
+            }
+        }
     }
 
     #[tokio::test]

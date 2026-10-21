@@ -50,13 +50,43 @@
   #chats a:hover { background: var(--bg); }
   #chats a.current { background: var(--mine); }
   #chats small { display: block; color: var(--muted); font-size: 12px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  #who { color: var(--muted); font-size: 14px; }
+  #login { max-width: 380px; margin: 12vh auto 0; padding: 24px 16px; }
+  #login form { display: flex; flex-direction: column; gap: 10px; }
+  #login label { font-size: 14px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+  #login input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px; font: inherit; }
+  #login input[aria-invalid=true] { border-color: var(--bad); }
+  .hint { font-size: 12px; color: var(--muted); min-height: 1.2em; }
+  .hint.error { color: var(--bad); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
-<main>
+<section id="login" class="card" hidden>
+  <h1>Document chat</h1>
+  <p class="sub" style="margin-bottom: 16px">Log in to see your files and chats.</p>
+  <form id="login-form" novalidate>
+    <label>Email
+      <input id="email" type="email" autocomplete="username" required>
+      <span class="hint" id="email-hint"></span>
+    </label>
+    <label>Password
+      <input id="password" type="password" autocomplete="current-password" required>
+      <span class="hint" id="password-hint"></span>
+    </label>
+    <button id="login-button" type="submit" disabled>Log in</button>
+    <div class="status" id="login-status"></div>
+  </form>
+</section>
+
+<main hidden>
   <header>
-    <h1>Document chat</h1>
-    <p class="sub">Upload text files, then ask about them. The answers come from the files and name the chunks they used.</p>
+    <div>
+      <h1>Document chat</h1>
+      <p class="sub">Upload text files, then ask about them. The answers come from the files and name the chunks they used.</p>
+    </div>
+    <div class="row"><span id="who"></span><button class="plain" id="logout">Log out</button></div>
   </header>
 
   <div class="col">
@@ -103,7 +133,9 @@ async function api(method, path, body, contentType) {
   const headers = contentType ? { "content-type": contentType } : {};
   const res = await fetch(path, { method, body, headers });
   const data = await res.json().catch(() => ({ error: `${res.status} ${res.statusText}` }));
-  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  // The session ended (logout in another tab, expiry): back to the login form.
+  if (res.status === 401 && !path.startsWith("/api/auth/")) showLogin();
+  if (!res.ok) throw Object.assign(new Error(data.error || `${res.status} ${res.statusText}`), { status: res.status });
   return data;
 }
 
@@ -280,10 +312,109 @@ async function refreshChats() {
   }
 }
 
-window.addEventListener("hashchange", openChat);
-refreshFiles();
-refreshChats();
-openChat();
+// --- Login ---------------------------------------------------------------
+// The rules come from the service, which checks the same ones: the page only
+// checks first, so a mistake shows before anything is sent.
+let rules = null;
+// Other tabs of this page: a logout in one ends the others at once.
+const tabs = "BroadcastChannel" in window ? new BroadcastChannel("auth") : null;
+
+function emailProblem(email) {
+  const n = [...email].length;
+  if (n < rules.email.min || n > rules.email.max) return `${rules.email.min}–${rules.email.max} characters`;
+  const at = email.indexOf("@");
+  if (at < 1 || at === email.length - 1 || email.indexOf("@", at + 1) !== -1 || /\s/.test(email)) return "one @ with something on both sides, no spaces";
+  return "";
+}
+
+function passwordProblem(password) {
+  const n = [...password].length;
+  return n < rules.password.min || n > rules.password.max ? `${rules.password.min}–${rules.password.max} characters` : "";
+}
+
+// A field shows its problem once the user has typed in it, not before.
+function checkLogin() {
+  if (!rules) return;
+  const email = $("email").value.trim(), password = $("password").value;
+  const problems = { email: emailProblem(email), password: passwordProblem(password) };
+  for (const [field, problem] of Object.entries(problems)) {
+    const input = $(field), shown = input.dataset.touched === "1";
+    input.setAttribute("aria-invalid", shown && problem ? "true" : "false");
+    $(`${field}-hint`).className = shown && problem ? "hint error" : "hint";
+    $(`${field}-hint`).textContent = shown ? problem : "";
+  }
+  $("login-button").disabled = Boolean(problems.email || problems.password);
+}
+
+for (const id of ["email", "password"]) {
+  $(id).addEventListener("input", () => { $(id).dataset.touched = "1"; checkLogin(); });
+}
+
+$("login-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const status = $("login-status");
+  $("login-button").disabled = true;
+  status.className = "status";
+  status.textContent = "Logging in…";
+  try {
+    const me = await api("POST", "/api/auth/login",
+      JSON.stringify({ email: $("email").value.trim(), password: $("password").value }), "application/json");
+    $("password").value = "";
+    tabs?.postMessage("login");
+    showApp(me);
+  } catch (err) {
+    status.className = "status error";
+    status.textContent = err.message;
+    checkLogin();
+  }
+};
+
+$("logout").onclick = async () => {
+  try { await api("POST", "/api/auth/logout"); } catch { /* the session may be gone already */ }
+  tabs?.postMessage("logout");
+  showLogin();
+};
+
+if (tabs) tabs.onmessage = (e) => { if (e.data === "logout") showLogin(); else if (e.data === "login") start(); };
+
+let shown = null;
+function showLogin() {
+  if (shown === "login") return;
+  shown = "login";
+  clearTimeout(refreshTimer);
+  document.querySelector("main").hidden = true;
+  $("login").hidden = false;
+  $("login-status").textContent = "";
+  $("email").focus();
+  checkLogin();
+}
+
+function showApp(me) {
+  shown = "app";
+  $("login").hidden = true;
+  document.querySelector("main").hidden = false;
+  $("who").textContent = me.email;
+  refreshFiles();
+  refreshChats();
+  openChat();
+}
+
+async function start() {
+  try {
+    rules = await api("GET", "/api/auth/rules");
+  } catch (e) {
+    $("login-status").className = "status error";
+    $("login-status").textContent = `Login rules: ${e.message}`;
+  }
+  try {
+    showApp(await api("GET", "/api/auth/me"));
+  } catch {
+    showLogin();
+  }
+}
+
+window.addEventListener("hashchange", () => { if (shown === "app") openChat(); });
+start();
 </script>
 </body>
 </html>

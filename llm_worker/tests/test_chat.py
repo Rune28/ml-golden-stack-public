@@ -91,8 +91,8 @@ async def chat(env):
             ChatWorkflow.run, ChatInput(chat_id=chat_id, max_turns=max_turns), id=f"chat-{chat_id}", task_queue=queue
         )
 
-        async def send(text, run_id=None):
-            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()))
+        async def send(text, run_id=None, user_id="ann"):
+            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()), user_id=user_id)
             # The workflow ID without a run: after continue-as-new it reaches the new run.
             latest = env.client.get_workflow_handle(handle.id)
             return await latest.execute_update(ChatWorkflow.send_message, message)
@@ -265,3 +265,15 @@ async def test_a_topic_without_a_query_is_gathered_by_the_message(chat):
 
     assert steps.of("gather")[0].question == "что там о смерти?"
     assert steps.of("summarize")[0].query == "что там о смерти?"
+
+
+async def test_the_user_of_a_message_reaches_every_step_that_reads(chat):
+    steps, start = chat
+    _, send = await start()
+
+    await send("what is S3?", user_id="ann")
+    steps.route_to = Route(kind="topic", terms=["смерти"])
+    await send("что там говорится о смерти?", user_id="ann")
+
+    for step in ("retrieve", "generate", "gather", "summarize"):
+        assert [i.user_id for i in steps.of(step)] == ["ann"], step

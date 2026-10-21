@@ -2,23 +2,33 @@
 name = "chat_service"
 version = "0.1.0"
 edition = "2024"
-description = "The chat product: a page to upload text files and ask about them, on the platform API (be_service)"
+description = "The chat product: a page behind a login to upload files and ask about them, on the platform API (be_service)"
 publish = false
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.5"
 axum = "0.8"
+base64 = "0.22"
 bytes = "1"
+deadpool-postgres = "0.14"
+jsonwebtoken = "9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+# Paused time in tests: a wait passes at once.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true

@@ -57,3 +57,8 @@ variable "s3_secret_key" {
   type      = string
   sensitive = true
 }
+
+variable "token_public_key" {
+  description = "PEM public key (Ed25519) the platform token of a user is checked with; the issuer (chat_service) holds the private half."
+  type        = string
+}

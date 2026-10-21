@@ -59,31 +59,50 @@ def run(activity_name, clickhouse, input):
 def test_retrieve_embeds_the_question_and_searches_only_its_model():
     clickhouse = FakeClickHouse(rows=[["file-1", "idx-1", 0, "notes.md", 0.1]])
 
-    sources, llm = run("retrieve", clickhouse, RetrieveInput(question="what?", k=3))
+    sources, llm = run("retrieve", clickhouse, RetrieveInput(question="what?", k=3, user_id="ann"))
 
     assert llm.embedded == [["what?"]]
     [(sql, parameters)] = clickhouse.queries
-    assert "FROM doc_chunks_current" in sql and "c.embed_model = {m:String}" in sql
-    # Chunks of deleted files never come back; one text takes one place.
-    assert "INNER JOIN (SELECT file_id, name FROM files FINAL)" in sql and "LIMIT 1 BY cityHash64(c.text)" in sql
-    assert parameters == {"q": [0.5, 0.5], "m": "bge-m3", "k": 3}
+    # Only the user's files: their current chunks and their names for the files.
+    assert "FROM doc_chunks_visible(user_id = {u:String})" in sql and "c.embed_model = {m:String}" in sql
+    assert "FROM files_visible(user_id = {u:String})" in sql and "LIMIT 1 BY cityHash64(c.text)" in sql
+    assert parameters == {"q": [0.5, 0.5], "m": "bge-m3", "k": 3, "u": "ann"}
     assert sources == [SOURCES[0]]
+
+
+def test_retrieve_without_a_user_reads_nothing():
+    clickhouse = FakeClickHouse(rows=[["file-1", "idx-1", 0, "notes.md", 0.1]])
+
+    sources, llm = run("retrieve", clickhouse, RetrieveInput(question="what?"))
+
+    assert sources == [] and clickhouse.queries == [] and llm.embedded == []
 
 
 def test_generate_numbers_the_sources_and_keeps_the_conversation():
     clickhouse = FakeClickHouse(rows=[["idx-2", 4, "Plan text."], ["idx-1", 0, "Notes text."]])
     history = [ChatMessage("user", "hi"), ChatMessage("assistant", "hello")]
 
-    generated, llm = run("generate", clickhouse, GenerateInput(question="what?", sources=SOURCES, history=history))
+    generated, llm = run("generate", clickhouse,
+                         GenerateInput(question="what?", sources=SOURCES, history=history, user_id="ann"))
 
     [(sql, parameters)] = clickhouse.queries
-    assert "FROM doc_chunks WHERE (run_id, chunk_id) IN" in sql
-    assert parameters == {"keys": [("idx-1", 0), ("idx-2", 4)]}
+    # Texts by key of every index run, of the user's files only.
+    assert "FROM doc_chunks_owned(user_id = {u:String}) WHERE (run_id, chunk_id) IN" in sql
+    assert parameters == {"keys": [("idx-1", 0), ("idx-2", 4)], "u": "ann"}
     system, *rest = llm.messages
     assert "[1] notes.md\nNotes text." in system["content"] and "[2] plan.md\nPlan text." in system["content"]
     assert rest == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
                     {"role": "user", "content": "what?"}]
     assert (generated.text, generated.model) == ("It says so [1].", "qwen3:4b")
+
+
+def test_generate_without_a_user_reads_no_chunk_texts():
+    clickhouse = FakeClickHouse(rows=[["idx-1", 0, "Notes text."]])
+
+    _, llm = run("generate", clickhouse, GenerateInput(question="what?", sources=SOURCES, history=[]))
+
+    assert clickhouse.queries == []
+    assert "Notes text." not in llm.messages[0]["content"]
 
 
 def test_generate_without_sources_asks_the_model_without_reading_chunks():

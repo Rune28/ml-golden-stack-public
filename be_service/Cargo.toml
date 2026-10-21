@@ -12,6 +12,7 @@ base64 = "0.22"
 bytes = "1"
 clickhouse = "0.15"
 flate2 = "1"
+jsonwebtoken = "9"
 reqwest = { version = "0.13", features = ["json", "query"] }
 rusty-s3 = "0.10"
 serde = { version = "1", features = ["derive"] }

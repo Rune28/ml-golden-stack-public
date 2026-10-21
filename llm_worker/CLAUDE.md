@@ -19,6 +19,11 @@ Temporal worker of the `llm` task queue: events processed in the worker as they 
 - Keys of documents (DOI, ISBN) come from the text by regular expressions, and only from its first pages, where the model reads the metadata too: the references of a paper carry the DOIs of other papers.
 - A file's chunks are indexed once each (`rag.chunking.distinct`), and retrieval takes one text once and only chunks of files that exist (an index committed after its file was deleted stays unseen).
 
+## What a user may read
+
+- Every message carries the `user_id` be_service took from the platform token, and every step of an answer gets it in its input. The steps read user data only through the views `*_visible(user_id = {u:String})` and, for texts by key, `doc_chunks_owned` (db/CLAUDE.md); an empty `user_id` reads nothing. `tests/test_visible.py` fails when `activities/chat.py` or `topic.py` names a table or a current view of user data.
+- The workflow `Chat` keeps no identity: a message is authorized when it comes.
+
 ## Retry safety (principles 4, 5)
 
 - `index_file` counts the rows of its own run: complete → skip, partial → delete this run's rows and write again; then `commit_run`, last.

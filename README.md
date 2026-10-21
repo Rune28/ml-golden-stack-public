@@ -271,9 +271,12 @@ Contracts that hold the pieces together:
 
 ## Retrieval and chat
 
-Files uploaded through the platform API become chunks with embeddings in ClickHouse; a chat answers questions from them and remembers the conversation ([docs/llm-plan.md](docs/llm-plan.md)).
+Files uploaded through the platform API become chunks with embeddings in ClickHouse; a chat answers questions from them and remembers the conversation ([docs/llm-plan.md](docs/llm-plan.md)). Every file, document and chat belongs to a user, and an answer is built only from the files of the user who asks ([docs/auth-plan.md](docs/auth-plan.md), [docs/data-model.md](docs/data-model.md)).
 
 ```bash
+make user-add EMAIL=you@example.org        # a user of the chat page (asks for the password)
+make adopt-orphans EMAIL=you@example.org   # once: files and chats from before the login become theirs
+export TOKEN=$(make -s token EMAIL=you@example.org)   # for the targets below, which call be_service directly
 make upload FILE=README.md   # stored in the object store, a row in ml_data.files, workflow Index
 make files                   # every file with its index state: indexing, indexed (chunks, model), failed
 make chat Q="what is S3?"    # a new chat: the answer, its sources and CHAT=<id>
@@ -288,9 +291,15 @@ make chat-ui-service         # the same as a systemd user service: always on :90
 | Index | Temporal `Index` → activity `index_file` in the worker (no Job, rule 12): chunks of about 1,000 characters, each text once, embedded 32 at a time by the LLM server | `ml_data.doc_chunks` under the run's `run_id`, marker `kind='index'`; readers use `doc_chunks_current` |
 | Chat | be_service: `POST /api/chats/<chat_id>/messages` → UpdateWithStart of the entity workflow `chat-<chat_id>`; activities `retrieve` (top 5 of `doc_chunks_current` for the current embedding model, files that exist only, each text once), `generate` (the chunks, the last 6 messages, the question), `record` | `ml_data.chat_messages` under the answer's `run_id` with its sources, marker `kind='answer'` |
 
-The same bytes uploaded again return the file already there. A file is indexed again with `POST /api/files/<file_id>/index`: after a failure, or with a new embedding model, whose vectors live next to the old ones until the new index is committed.
+### Login and the data of a user
 
-`DELETE /api/files/<file_id>` (a Delete button on the chat page) removes a file and what was made from it, in this order: its index markers (it leaves every answer at once), its chunks, its bytes, its row (while the row is there, a retried call finds the file and finishes). It is refused while the file is being indexed; answers recorded earlier keep the keys of the chunks they used.
+- **The login** is chat_service's: users, their identities (a password today, an identity provider later) and sessions in its own Postgres database `chat` (`db/postgres/chat/migrations`, applied by a Job before it starts). Users are created by an admin (`make user-add`); a password is argon2id; a session is a random token in a cookie `HttpOnly; Secure; SameSite=Strict`, of which Postgres keeps only the sha256; a change must come from the page's own `Origin`; after 5 failed logins of an email in 15 minutes a login is refused for a while. The page checks its fields by the rules `GET /api/auth/rules` gives, the ones the service checks itself.
+- **The platform token**: chat_service calls be_service for the logged-in user with an Ed25519 JWT (`sub` = `user_id`, `aud` = `platform`, 5 minutes) signed by its private key; be_service holds only the public key (OpenTofu `tls_private_key` gives both), checks it on every product route and refuses the call with 401 otherwise. An identity provider later issues such tokens instead, and be_service takes its public keys from the provider: the way to zero-trust access.
+- **What a user sees**: `file_owners` and `chat_owners` link users to files and chats (one file of two users is one file with two links, indexed once, each with their own name for it). Readers of user data read only the views `*_visible(user_id = ...)`, which join those links; a test in be_service and in llm_worker fails when reading code names a table of user data directly. The user_id comes with every chat message from be_service, and every step of the answer reads with it; without one, a step reads nothing. A file or chat of someone else is a 404, and an upload says `duplicate` only for the user's own files. `make auth-check` checks all of it with two new users.
+
+The same bytes uploaded again by the same user return the file already there. A file is indexed again with `POST /api/files/<file_id>/index`: after a failure, or with a new embedding model, whose vectors live next to the old ones until the new index is committed.
+
+`DELETE /api/files/<file_id>` (a Delete button on the chat page) removes the user's link to a file; when no other user has it, the file goes with what was made from it, in this order: its index markers (it leaves every answer at once), its chunks, its bytes, its row (while the row is there, a retried call finds the file and finishes). It is refused while the file is being indexed; answers recorded earlier keep the keys of the chunks they used.
 
 The open chat is in the page address (`#chat=<id>`): a reload or a link opens it again with its history (`GET /api/chats/<chat_id>/messages`, the committed turns from the view `chat_messages_committed`), and the page lists earlier chats (`GET /api/chats`).
 

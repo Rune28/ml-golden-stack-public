@@ -1,6 +1,6 @@
 # Data model
 
-The stores of the platform and what lives in each, as it stands after the login stage ([auth-plan.md](auth-plan.md)). Tables and views marked **A2** are planned, not built yet; the rest is in `db/clickhouse/migrations`. The MNIST tables (`samples`, `predictions`, `digit_report`) are left out: the login stage does not touch them.
+The stores of the platform and what lives in each, as it stands after the login stage ([auth-plan.md](auth-plan.md)): `db/postgres/chat/migrations` and `db/clickhouse/migrations`. Marked **A2**: the owner links and the views of what a user may see, added with the login. The MNIST tables (`samples`, `predictions`, `digit_report`) are left out: the login stage does not touch them.
 
 Two stores, by what the data needs:
 
@@ -79,7 +79,8 @@ erDiagram
     file_owners {
         String user_id PK "A2"
         String file_id PK "A2; a link, not a column"
-        DateTime added_at
+        String name "the user's own name for the file"
+        DateTime64 added_at "the user's upload"
     }
     chat_owners {
         String user_id PK "A2"
@@ -212,5 +213,5 @@ flowchart LR
 - **Writers write tables only**, each row under the `run_id` of its run, the marker in `runs` last.
 - **`*_current`** leaves out runs halfway, runs replaced by a newer one, and files deleted since (rule 11).
 - **Hubs** (`hub_document`, `hub_author`, `link_document_file`) are views of the keys of current runs and have no table of their own: their keys are found by a model, so a key of a failed or replaced run must not stay visible.
-- **`*_visible(user_id)`** (A2) is all that be_service and the steps of an answer read: a user sees a file only through their own link in `file_owners`.
+- **`*_visible(user_id)`** (A2) is all that be_service and the steps of an answer read: a user sees a file only through their own link in `file_owners`, under their own name for it. `term_vectors_visible` belongs here too: the vectors of the keywords, by which a topic finds similar terms, are of the user's documents.
 - **`doc_chunks_owned`** (A2) reads texts by key from every run, of the user's files only: an index committed while an answer is being written must not hide the chunks the answer is built from.

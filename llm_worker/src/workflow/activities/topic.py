@@ -8,11 +8,11 @@ Stream work (README, rule 12), blocking, on the worker's thread pool.
   topic.
 - gather turns those words into stored terms (rag.topics.lemmas), takes
   with each the stored terms that name the same subject (the closest by
-  vector in term_vectors_current, picked by the chat model) and finds the
-  chunks: a term in the keywords of chunks (chunk_mentions_current), its
+  vector in term_vectors_visible, picked by the chat model) and finds the
+  chunks: a term in the keywords of chunks (chunk_mentions_visible), its
   own or a similar one's, is
   selective and gives its chunks; a term that is only a theme of whole
-  documents (document_themes_current, in more than MAX_SHARE of their
+  documents (document_themes_visible, in more than MAX_SHARE of their
   chunks, so never a keyword of one chunk) narrows the documents. Only
   themes of whole documents: the topic is too broad to gather. Nothing
   found, or fewer chunks than min_chunks: the question is answered as a fact.
@@ -86,17 +86,21 @@ class TopicSteps:
     @activity.defn(name="gather")
     def gather(self, input: GatherInput) -> Gathered:
         stored = list(dict.fromkeys(s for s in map(lemmas, input.terms) if s))
-        if not stored:
+        # Only the user's files, through the views of what they may see; with
+        # no user, nothing (fail closed).
+        if not stored or not input.user_id:
             return Gathered(mode="none")
+        user = input.user_id
         client = self.connect()
-        similar = {t: self.similar(client, t, input.question) for t in stored}
+        similar = {t: self.similar(client, t, input.question, user) for t in stored}
 
         # The chunks of a term: those its own or a similar term is a keyword of.
         variants = {t: [t, *similar[t]] for t in stored}
         by_variant: dict[str, set[tuple[str, str, int]]] = {}
         for term, file_id, index_run_id, chunk_id in client.query(
-            "SELECT term, file_id, index_run_id, chunk_id FROM chunk_mentions_current WHERE term IN {t:Array(String)}",
-            parameters={"t": sorted({v for vs in variants.values() for v in vs})},
+            "SELECT term, file_id, index_run_id, chunk_id FROM chunk_mentions_visible(user_id = {u:String}) "
+            "WHERE term IN {t:Array(String)}",
+            parameters={"t": sorted({v for vs in variants.values() for v in vs}), "u": user},
         ).result_rows:
             by_variant.setdefault(term, set()).add((file_id, index_run_id, chunk_id))
         chunks = {t: set().union(*(by_variant.get(v, set()) for v in vs)) for t, vs in variants.items()}
@@ -105,10 +109,10 @@ class TopicSteps:
         broad = [
             Broad(term=t, file_id=f, name=n, chunks=c)
             for t, f, n, c in client.query(
-                "SELECT t.term, t.file_id, f.name, t.chunks FROM document_themes_current AS t "
-                "INNER JOIN (SELECT file_id, name FROM files FINAL) AS f ON f.file_id = t.file_id "
+                "SELECT t.term, t.file_id, f.name, t.chunks FROM document_themes_visible(user_id = {u:String}) AS t "
+                "INNER JOIN (SELECT file_id, name FROM files_visible(user_id = {u:String})) AS f ON f.file_id = t.file_id "
                 "WHERE t.term IN {t:Array(String)} AND t.share >= {s:Float32} ORDER BY t.chunks DESC",
-                parameters={"t": stored, "s": MAX_SHARE},
+                parameters={"t": stored, "s": MAX_SHARE, "u": user},
             ).result_rows
         ]
         broad_terms = {b.term for b in broad} - set(chunks)
@@ -135,10 +139,10 @@ class TopicSteps:
             return Gathered(mode="none", terms=stored, found=len(found), similar=similar)
         keys = sorted(found)
         if len(keys) > input.max_chunks:
-            keys = self.closest(client, input.question, keys, input.max_chunks)
+            keys = self.closest(client, input.question, keys, input.max_chunks, user)
         names = dict(client.query(
-            "SELECT file_id, name FROM files FINAL WHERE file_id IN {f:Array(String)}",
-            parameters={"f": sorted({k[0] for k in keys})},
+            "SELECT file_id, name FROM files_visible(user_id = {u:String}) WHERE file_id IN {f:Array(String)}",
+            parameters={"f": sorted({k[0] for k in keys}), "u": user},
         ).result_rows)
         log.info("topic %s (similar %s): %d chunks found, %d taken", stored, similar, len(found), len(keys))
         return Gathered(
@@ -146,39 +150,45 @@ class TopicSteps:
             sources=[Source(file_id=f, index_run_id=r, chunk_id=c, name=names.get(f, "")) for f, r, c in keys],
         )
 
-    def similar(self, client, term: str, query: str) -> list[str]:
+    def similar(self, client, term: str, query: str, user: str) -> list[str]:
         """The stored terms that name what `term` does, other than itself: the
         closest by vector are the candidates, the chat model picks. Nothing
         stored close to it (or no vectors yet): no call to the model."""
         [vector] = self.llm.embed([term])
         candidates = [t for t, _ in client.query(
-            "SELECT term, min(cosineDistance(embedding, {q:Array(Float32)})) AS distance FROM term_vectors_current "
+            "SELECT term, min(cosineDistance(embedding, {q:Array(Float32)})) AS distance "
+            "FROM term_vectors_visible(user_id = {u:String}) "
             "WHERE embed_model = {m:String} AND term != {t:String} GROUP BY term HAVING distance <= {d:Float32} "
             "ORDER BY distance LIMIT {n:UInt32}",
             parameters={"q": vector, "m": self.llm.embed_model, "t": term, "d": SIMILAR_MAX_DISTANCE,
-                        "n": SIMILAR_CANDIDATES},
+                        "n": SIMILAR_CANDIDATES, "u": user},
         ).result_rows]
         if not candidates:
             return []
         prompt = SIMILAR_PROMPT.format(term=term, query=query, candidates="\n".join(candidates))
         return similar_from(self.llm.chat_json([{"role": "user", "content": prompt}], SIMILAR_SCHEMA), candidates)
 
-    def closest(self, client, question: str, keys: list[tuple[str, str, int]], n: int) -> list[tuple[str, str, int]]:
+    def closest(self, client, question: str, keys: list[tuple[str, str, int]], n: int,
+                user: str) -> list[tuple[str, str, int]]:
         """The n keys closest to the question, in the order of the text."""
         [vector] = self.llm.embed([question])
         rows = client.query(
-            "SELECT file_id, run_id, chunk_id FROM doc_chunks WHERE (run_id, chunk_id) IN {k:Array(Tuple(String, UInt32))} "
+            "SELECT file_id, run_id, chunk_id FROM doc_chunks_owned(user_id = {u:String}) "
+            "WHERE (run_id, chunk_id) IN {k:Array(Tuple(String, UInt32))} "
             "AND embed_model = {m:String} ORDER BY cosineDistance(embedding, {q:Array(Float32)}) LIMIT {n:UInt32}",
-            parameters={"k": [(r, c) for _, r, c in keys], "m": self.llm.embed_model, "q": vector, "n": n},
+            parameters={"k": [(r, c) for _, r, c in keys], "m": self.llm.embed_model, "q": vector, "n": n, "u": user},
         ).result_rows
         return sorted((f, r, c) for f, r, c in rows)
 
     @activity.defn(name="summarize")
     def summarize(self, input: SummarizeInput) -> Generated:
+        # Texts of the user's files only: a key of someone else's chunk reads
+        # nothing, and with no user nothing is read (fail closed).
         texts = dict(((r, c), t) for r, c, t in self.connect().query(
-            "SELECT run_id, chunk_id, text FROM doc_chunks WHERE (run_id, chunk_id) IN {k:Array(Tuple(String, UInt32))}",
-            parameters={"k": [(s.index_run_id, s.chunk_id) for s in input.sources]},
-        ).result_rows)
+            "SELECT run_id, chunk_id, text FROM doc_chunks_owned(user_id = {u:String}) "
+            "WHERE (run_id, chunk_id) IN {k:Array(Tuple(String, UInt32))}",
+            parameters={"k": [(s.index_run_id, s.chunk_id) for s in input.sources], "u": input.user_id},
+        ).result_rows) if input.user_id else {}
         q, calls = input.question, 0
 
         def ask(prompt: str, schema: dict, given: str | None = None) -> dict:

@@ -19,6 +19,16 @@ Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`, `c
 
 Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. Deleting a file (be_service) removes what was made from it in reader order: the markers of its runs (index, document), the document rows, the chunks, the object, the row last.
 
+## Postgres: the database `chat`
+
+- chat_service's own database (principle 9): users, identities, sessions, failed logins. `db/postgres/chat/migrations`, golang-migrate files like ClickHouse's, applied by a Job (`modules/postgres-migrate`) before chat_service starts; expand, then contract, the same way.
+- A user is the `user_id` of `users`; how they log in is a row of `identities` (`provider`, `subject`). The owner links in ClickHouse refer to `user_id`, so a new way to log in is a new identity, not a new user.
+
+## What a user may see
+
+- `file_owners` and `chat_owners` link users to files and chats: reference data with a natural key, written and deleted by be_service. The name of a file and the time of its upload are on the link: each user's own.
+- Readers of user data (be_service `visible.rs`, the steps of an answer in llm_worker) read only the parameterized views `*_visible(user_id = ...)`, which join the links; `doc_chunks_owned` is the same for texts by key of every run. A new table or current view of user data comes with its `*_visible` view, and readers read that.
+
 ## Data Vault of documents
 
 - Satellites (`sat_*`) and links (`link_*`) are outputs of runs, keyed by `run_id` like any other.

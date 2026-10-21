@@ -154,6 +154,14 @@ module "llm_worker" {
   depends_on = [module.clickhouse_migrate]
 }
 
+# The key pair of the platform token: chat_service signs with the private
+# key, be_service checks with the public one and cannot make a token itself.
+# An identity provider later replaces the private half; be_service then takes
+# public keys from its JWKS.
+resource "tls_private_key" "platform_token" {
+  algorithm = "ED25519"
+}
+
 module "be_service" {
   source = "../../modules/be-service"
 
@@ -181,17 +189,62 @@ module "be_service" {
     type      = "NodePort"
     node_port = var.app_node_port
   }
-  node_selector = local.platform_node_selector
+  node_selector    = local.platform_node_selector
+  token_public_key = tls_private_key.platform_token.public_key_pem
 
   depends_on = [module.clickhouse_migrate]
 }
 
 # The product: the chat page, on the platform API. Reached on the host with
 # `make chat-ui` (a port-forward): the kind cluster has no free port mapping.
+# The chat product keeps its users and sessions in a database of its own
+# on the shared server (principle 9), migrated before it starts.
+module "chat_db" {
+  source = "../../modules/postgres-database"
+
+  name      = "chat"
+  namespace = local.stores.postgres.namespace
+  postgres = {
+    host = local.stores.postgres.host
+    port = local.stores.postgres.port
+    user = local.stores.postgres.user
+  }
+  postgres_password = local.stores.postgres_password
+  node_selector     = local.platform_node_selector
+}
+
+module "chat_db_migrate" {
+  source = "../../modules/postgres-migrate"
+
+  name           = "chat-db-migrate"
+  namespace      = local.stores.postgres.namespace
+  migrations_dir = "${path.root}/../../../db/postgres/chat/migrations"
+  db = {
+    host     = module.chat_db.host
+    port     = module.chat_db.port
+    database = module.chat_db.database
+    user     = module.chat_db.user
+  }
+  db_password   = module.chat_db.password
+  node_selector = local.platform_node_selector
+}
+
 module "chat_service" {
   source = "../../modules/chat-service"
 
   image            = var.images.chat_service
   platform_api_url = module.be_service.url
-  node_selector    = local.platform_node_selector
+  # The page through make chat-ui (a port-forward to 127.0.0.1:9002).
+  public_origins = ["http://127.0.0.1:9002", "http://localhost:9002"]
+  db = {
+    host     = module.chat_db.host
+    port     = module.chat_db.port
+    database = module.chat_db.database
+    user     = module.chat_db.user
+  }
+  db_password       = module.chat_db.password
+  token_private_key = tls_private_key.platform_token.private_key_pem
+  node_selector     = local.platform_node_selector
+
+  depends_on = [module.chat_db_migrate]
 }

@@ -18,8 +18,41 @@ Documents, authors and concepts as Data Vault hubs with links, so a question abo
 
 A login window and files, documents, chats and answers of every user their own, built to grow into ZTNA. Plan, decisions and slices: [docs/auth-plan.md](docs/auth-plan.md).
 
-- [ ] A1 Login: users and sessions in Postgres (chat_service), login form with checks on both sides, `make user-add`
-- [ ] A2 Principal and ownership: JWT from chat_service to be_service, `file_owners`, `chat_owners`, retrieval filtered by the user
+- [x] A1 Login: users, identities and sessions in Postgres (chat_service), login form with checks on both sides, `make user-add`, `make user-password`
+- [x] A2 Principal and ownership: EdDSA JWT from chat_service to be_service, `file_owners`, `chat_owners`, `*_visible(user_id)` views read by be_service and the steps of an answer, `make token`, `make adopt-orphans`, `make auth-check`
+- [ ] Deleting the last link of a file while another user uploads the same bytes: the second user gets a link to a file being deleted and has to upload it again (`files::remove`)
+- [ ] The documents of a user on the chat page (`GET /api/documents` is proxied by chat_service, not shown yet)
+
+### From the audit of the login (2026-10-21)
+
+Fixed then: argon2 checks bounded (a burst of logins took the pod's memory), attempts counted before the check under a lock per email, sessions 7 days at most and a cookie without `Max-Age`, a 401 of the platform no longer shown as the end of the session. Left:
+
+- [ ] User isolation holds only at the API of be_service. Around it: the Temporal UI shows the histories of every chat (messages and answers of all users), the filer of SeaweedFS every file, ClickHouse has one user `platform` for every service, and llm_worker trusts the `user_id` of a message, so whoever can start a workflow (the Temporal frontend has no auth, the cluster no NetworkPolicy) reads any user's data. Open on 127.0.0.1 of the laptop only; the steps are in "Later" of docs/auth-plan.md (NetworkPolicies, mTLS, the UIs behind a login)
+- [ ] A new login does not end the earlier session of the same browser; expired and revoked rows of `sessions` are never deleted
+- [ ] `make token MINUTES=` has no upper bound, and be_service cannot revoke a token: bound it (24 hours)
+- [ ] The dummy hash is made on the first login with an unknown email, which then takes twice as long once: make it at start
+- [ ] Headers of the page: `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`
+- [ ] The conditions in SQL of `PgStore` (`session_user`, `claim_attempt`) are checked by no test: `FakeStore` models neither expiry nor the lock; a test against a Postgres
+
+### The chat page on a phone
+
+The page has a viewport and goes to one column under 760 px, and the login form fits a phone; the rest is made for a desktop. A change of `chat_service/static/index.html` only, mostly CSS (some 60-80 lines) and a little script; to be seen at 390 px in a headless browser (a Playwright image) or from a phone once the page is reachable (below).
+
+- [ ] Under 760 px tabs Chat · Files · Chats, the chat first, instead of one long column where the chat comes after the files and the chats
+- [ ] A file in two lines on a narrow screen (the name; then size, state, Delete) instead of a table of four columns
+- [ ] Touch targets of at least 44 px (the Delete button is 12 px with 2 px of padding)
+- [ ] The question box at the bottom, a larger Send, no "Ctrl+Enter" hint on touch screens; heights in `dvh`, so the keyboard does not hide the box
+- [ ] Inputs at 16 px: iOS Safari zooms into a field with a smaller font
+- [ ] Sources of an answer folded ("Sources (48)"): an answer about a topic can name dozens
+
+### Before the chat page is reachable from the internet
+
+Today the page is reached only through a port-forward on the laptop. Through a tunnel (Tailscale for one's own devices; Cloudflare Tunnel with Cloudflare Access in front of the login for others, the identity-aware proxy of docs/auth-plan.md) only chat_service would be exposed, never be_service or the other services. Before that:
+
+- [ ] `chat_service user-disable EMAIL` (and `make user-disable`): the test users have known passwords, `a1-check@example.org` and the `auth-check-*` users, whose password follows a pattern in the repository; `scripts/auth-check.sh` disables its users at the end
+- [ ] Failed logins counted per client address behind the trusted proxy (the address it reports, such as `CF-Connecting-IP`), and the limit for the whole service removed: on the internet, 100 failures in 15 minutes from anyone lock everyone out
+- [ ] The public origin (`https://chat.<domain>`) in `public_origins` of `envs/local`, or every POST, the login included, is refused with 403
+- [ ] A bound on what one user takes of the model server (answers in flight per user), and the memory of the LLM server settled (above)
 
 ## Done: LLM conveyor
 

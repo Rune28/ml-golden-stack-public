@@ -95,6 +95,10 @@ class MessageInput:
     # The answer run, made by be_service (UUID v7). Also the Update ID, so a
     # call retried by the client is answered once.
     run_id: str
+    # Who asks: from the platform token, checked by be_service, which also
+    # checked that the chat is theirs. Every step of the answer reads only
+    # this user's files; empty, a step reads nothing (fail closed).
+    user_id: str = ""
 
 
 @dataclass
@@ -121,6 +125,7 @@ class Answer:
 class RetrieveInput:
     question: str
     k: int = 5
+    user_id: str = ""
 
 
 @dataclass
@@ -128,6 +133,7 @@ class GenerateInput:
     question: str
     sources: list[Source]
     history: list[ChatMessage]
+    user_id: str = ""
 
 
 @dataclass
@@ -170,6 +176,7 @@ class GatherInput:
     max_chunks: int = 60
     # Fewer chunks found: answered as a fact (rag.topics.MIN_CHUNKS).
     min_chunks: int = 6
+    user_id: str = ""
 
 
 @dataclass
@@ -204,3 +211,4 @@ class SummarizeInput:
     # The short query of the route: themes are named after it, not after the
     # story of a long message. Empty: the question.
     query: str = ""
+    user_id: str = ""

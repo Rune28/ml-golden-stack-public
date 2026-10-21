@@ -1,7 +1,6 @@
 //! ClickHouse tables of be_service: `samples` (Add data), `files` (uploads),
 //! and reads of the rest. Created by db/clickhouse/migrations, never here.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use anyhow::Result;
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::Serialize_repr;
 
 use crate::mnist::{Split, SplitKind};
+use crate::visible::Visible;
 
 /// What ingest needs from the table; a fake implements it in tests.
 pub trait SampleStore {
@@ -138,12 +138,6 @@ pub struct ChatMessageRow {
     pub sources: Vec<(String, String, u32)>,
 }
 
-#[derive(Deserialize, Row)]
-struct FileName {
-    file_id: String,
-    name: String,
-}
-
 /// An uploaded file with its current index: `chunks` is 0 until an index
 /// run of it is committed to the run registry.
 #[derive(Deserialize, Row, Debug)]
@@ -169,6 +163,21 @@ pub struct DocumentRow {
     pub files: Vec<String>,
     /// The top themes of the file the fields come from, by rank.
     pub themes: Vec<String>,
+}
+
+/// `added_at` is left to its DEFAULT now64().
+#[derive(Serialize, Row)]
+struct OwnerInsert<'a> {
+    user_id: &'a str,
+    file_id: &'a str,
+    name: &'a str,
+}
+
+/// `created_at` is left to its DEFAULT now().
+#[derive(Serialize, Row)]
+struct ChatOwnerInsert<'a> {
+    user_id: &'a str,
+    chat_id: &'a str,
 }
 
 /// `uploaded_at` is left to its DEFAULT now64().
@@ -268,14 +277,57 @@ impl ClickHouse {
             .await?)
     }
 
-    /// file_id is the sha256 of the bytes: also "were these bytes uploaded before".
-    pub async fn file(&self, file_id: &str) -> Result<Option<StoredFile>> {
+    /// The reads of one user, through the views of what they may see (visible.rs).
+    pub fn visible<'a>(&'a self, user: &'a str) -> Visible<'a> {
+        Visible { client: &self.client, user }
+    }
+
+    /// Whether these bytes are stored, by anyone: file_id is the sha256 of
+    /// the bytes. A writer's check, never shown to a user as it is: an upload
+    /// tells the uploader only about their own files.
+    pub async fn stored_file(&self, file_id: &str) -> Result<Option<StoredFile>> {
         Ok(self
             .client
             .query("SELECT file_id, name, size FROM files WHERE file_id = ? LIMIT 1")
             .bind(file_id)
             .fetch_optional()
             .await?)
+    }
+
+    /// A user's link to a file, with their name for it: the file is now theirs too.
+    pub async fn add_owner(&self, user: &str, file_id: &str, name: &str) -> Result<()> {
+        let mut insert = self.client.insert::<OwnerInsert>("file_owners").await?;
+        insert.write(&OwnerInsert { user_id: user, file_id, name }).await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    pub async fn remove_owner(&self, user: &str, file_id: &str) -> Result<()> {
+        self.client
+            .query("DELETE FROM file_owners WHERE user_id = ? AND file_id = ?")
+            .bind(user)
+            .bind(file_id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Links of a file left: none, and the file goes.
+    pub async fn owner_count(&self, file_id: &str) -> Result<u64> {
+        Ok(self
+            .client
+            .query("SELECT count() FROM file_owners FINAL WHERE file_id = ?")
+            .bind(file_id)
+            .fetch_one()
+            .await?)
+    }
+
+    /// The user who started a chat: only they may send to it and read it.
+    pub async fn add_chat_owner(&self, user: &str, chat_id: &str) -> Result<()> {
+        let mut insert = self.client.insert::<ChatOwnerInsert>("chat_owners").await?;
+        insert.write(&ChatOwnerInsert { user_id: user, chat_id }).await?;
+        insert.end().await?;
+        Ok(())
     }
 
     /// Written after the bytes are in the object store: a listed file is always there.
@@ -315,94 +367,6 @@ impl ClickHouse {
     pub async fn delete_file(&self, file_id: &str) -> Result<()> {
         self.client.query("DELETE FROM files WHERE file_id = ?").bind(file_id).execute().await?;
         Ok(())
-    }
-
-    /// Conversations, the latest first. Through chat_messages_committed: a
-    /// turn written halfway never shows (README, rule 11).
-    pub async fn chats(&self, limit: u64) -> Result<Vec<ChatSummary>> {
-        Ok(self
-            .client
-            .query(
-                "SELECT chat_id, argMinIf(text, turn, role = 'user') AS title, toUInt32(max(turn)) AS turns, \
-                 toUInt32(toUnixTimestamp(max(created_at))) AS last_at FROM chat_messages_committed \
-                 GROUP BY chat_id ORDER BY last_at DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all()
-            .await?)
-    }
-
-    /// The committed turns of one conversation, in order, the question before its answer.
-    pub async fn chat_messages(&self, chat_id: &str) -> Result<Vec<ChatMessageRow>> {
-        Ok(self
-            .client
-            .query(
-                // The client cannot read named tuples (the column type in 0013): cast to
-                // a plain one, the same values.
-                "SELECT turn, role, text, CAST(sources, 'Array(Tuple(String, String, UInt32))') AS sources \
-                 FROM chat_messages_committed WHERE chat_id = ? ORDER BY turn, role = 'assistant'",
-            )
-            .bind(chat_id)
-            .fetch_all()
-            .await?)
-    }
-
-    /// Names of files by id; a deleted file has none.
-    pub async fn file_names(&self, file_ids: &[String]) -> Result<HashMap<String, String>> {
-        let rows: Vec<FileName> = self
-            .client
-            .query("SELECT file_id, name FROM files FINAL WHERE has(?, file_id)")
-            .bind(file_ids)
-            .fetch_all()
-            .await?;
-        Ok(rows.into_iter().map(|r| (r.file_id, r.name)).collect())
-    }
-
-    /// Uploaded files, newest first, each with its latest committed index
-    /// (README, rule 11: a run exists once its marker is in the registry).
-    pub async fn files(&self, limit: u64) -> Result<Vec<FileRow>> {
-        Ok(self
-            .client
-            .query(
-                "SELECT f.file_id AS file_id, f.name AS name, f.size AS size, \
-                 toUInt32(toUnixTimestamp(f.uploaded_at)) AS uploaded_at, r.chunks AS chunks, \
-                 r.embed_model AS embed_model FROM files AS f FINAL \
-                 LEFT JOIN (SELECT parents['file_id'] AS file_id, argMax(rows, started_at) AS chunks, \
-                 argMax(parents['embed_model'], started_at) AS embed_model \
-                 FROM runs FINAL WHERE kind = 'index' GROUP BY file_id) AS r ON r.file_id = f.file_id \
-                 ORDER BY f.uploaded_at DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all()
-            .await?)
-    }
-
-    /// Documents, the latest read first. Through the views of current runs
-    /// (README, rule 11): a run halfway or of a deleted file never shows.
-    pub async fn documents(&self, limit: u64, top_themes: u32) -> Result<Vec<DocumentRow>> {
-        Ok(self
-            .client
-            .query(
-                "SELECT d.document_id AS document_id, d.title AS title, d.year AS year, d.kind AS kind, \
-                 d.keywords AS keywords, a.authors AS authors, d.files AS files, t.themes AS themes FROM ( \
-                   SELECT s.document_id AS document_id, argMax(s.run_id, r.started_at) AS run_id, \
-                   argMax(s.file_id, r.started_at) AS file_id, \
-                   argMax(s.title, r.started_at) AS title, argMax(s.year, r.started_at) AS year, \
-                   argMax(s.kind, r.started_at) AS kind, argMax(s.keywords, r.started_at) AS keywords, \
-                   groupUniqArray(s.file_id) AS files, max(r.started_at) AS read_at \
-                   FROM sat_document_current AS s \
-                   INNER JOIN (SELECT run_id, started_at FROM runs FINAL WHERE kind = 'document') AS r \
-                   ON r.run_id = s.run_id GROUP BY s.document_id) AS d \
-                 LEFT JOIN (SELECT run_id, arrayMap(p -> p.2, arraySort(groupArray((position, name)))) AS authors \
-                   FROM link_document_author_current GROUP BY run_id) AS a ON a.run_id = d.run_id \
-                 LEFT JOIN (SELECT file_id, arrayMap(p -> p.2, arraySort(groupArray((rank, term)))) AS themes \
-                   FROM document_themes_current WHERE rank <= ? GROUP BY file_id) AS t ON t.file_id = d.file_id \
-                 ORDER BY d.read_at DESC LIMIT ?",
-            )
-            .bind(top_themes)
-            .bind(limit)
-            .fetch_all()
-            .await?)
     }
 
     /// Accuracy per true digit in one prediction run.

@@ -26,7 +26,7 @@ endif
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         stores-init stores-plan stores-up stores-down \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat chat-ui chat-ui-service k9s \
+        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat user-add user-password token adopt-orphans auth-check chat-ui chat-ui-service k9s \
         preflight check-owner host-setup test fmt validate
 
 help:
@@ -56,6 +56,11 @@ help:
 	@echo "documents        documents read from the files: title, authors, year, keywords"
 	@echo "reindex-all      every uploaded file through Index again (after new Index steps)"
 	@echo "chat Q=\"...\"      a question about the files; prints CHAT=<id>, pass it to go on in that chat"
+	@echo "user-add EMAIL=  a user of the chat page (asks for the password)"
+	@echo "user-password EMAIL=  a new password; every session of the user ends"
+	@echo "token EMAIL=     a platform token of the user: export TOKEN=\$$(make -s token EMAIL=...) for the targets below"
+	@echo "adopt-orphans EMAIL=  once: files and chats without an owner become the user's"
+	@echo "auth-check       two users, each sees only their own files, chats and answers"
 	@echo "chat-ui          the chat page on http://127.0.0.1:9002 (a port-forward that restarts itself, Ctrl+C to stop)"
 	@echo "chat-ui-service  the same as a systemd user service: always on :9002, also after reboots"
 	@echo "k9s              the cluster in k9s, all namespaces (k9s itself is installed on the host, not in the cluster)"
@@ -180,34 +185,83 @@ report:
 llm-check:
 	$(KUBECTL) -n llm-worker exec deploy/llm-worker -- python -m workflow.llm
 
-# The same calls the chat page makes, through the platform API (be_service).
+# Users of the chat page are created by an admin: whoever has kubectl on the
+# cluster. The password is read here without echo and goes to the command in
+# the chat-service pod on stdin, never on a command line.
+user-add:
+	@test -n "$(EMAIL)" || { echo "usage: make user-add EMAIL=you@example.org"; exit 1; }
+	@printf 'Password for $(EMAIL) (12-128 characters): '; stty -echo 2>/dev/null; read -r pw; stty echo 2>/dev/null; echo; \
+	  printf '%s\n' "$$pw" | $(KUBECTL) -n chat-service exec -i deploy/chat-service -- /chat_service user-add "$(EMAIL)"
+
+user-password:
+	@test -n "$(EMAIL)" || { echo "usage: make user-password EMAIL=you@example.org"; exit 1; }
+	@printf 'New password for $(EMAIL): '; stty -echo 2>/dev/null; read -r pw; stty echo 2>/dev/null; echo; \
+	  printf '%s\n' "$$pw" | $(KUBECTL) -n chat-service exec -i deploy/chat-service -- /chat_service user-password "$(EMAIL)"
+
+# A platform token of a user, for the calls below to be_service by hand:
+#   export TOKEN=$(make -s token EMAIL=you@example.org)
+MINUTES ?= 60
+token:
+	@test -n "$(EMAIL)" || { echo "usage: make token EMAIL=you@example.org [MINUTES=60]"; exit 1; }
+	@$(KUBECTL) -n chat-service exec deploy/chat-service -- /chat_service token "$(EMAIL)" $(MINUTES)
+
+# Once, after the login came: every file and chat without an owner becomes
+# the user's (the data uploaded before there were users).
+adopt-orphans:
+	@test -n "$(EMAIL)" || { echo "usage: make adopt-orphans EMAIL=you@example.org"; exit 1; }
+	@uid=$$($(KUBECTL) -n chat-service exec deploy/chat-service -- /chat_service user-id "$(EMAIL)") || exit 1; \
+	  echo "$$uid" | grep -Eq '^[0-9a-f-]{36}$$' || { echo "not a user_id: $$uid"; exit 1; }; \
+	  $(KUBECTL) -n clickhouse exec clickhouse-0 -- clickhouse-client -n -q " \
+	    INSERT INTO ml_data.file_owners (user_id, file_id, name) SELECT '$$uid', file_id, name FROM ml_data.files FINAL \
+	      WHERE file_id NOT IN (SELECT file_id FROM ml_data.file_owners FINAL); \
+	    INSERT INTO ml_data.chat_owners (user_id, chat_id) SELECT DISTINCT '$$uid', chat_id FROM ml_data.chat_messages \
+	      WHERE chat_id NOT IN (SELECT chat_id FROM ml_data.chat_owners FINAL); \
+	    SELECT 'files of the user', count() FROM ml_data.file_owners FINAL WHERE user_id = '$$uid'; \
+	    SELECT 'chats of the user', count() FROM ml_data.chat_owners FINAL WHERE user_id = '$$uid'"
+
+# Two users, each with a file of their own: each sees only theirs, and an
+# answer to one never comes from the other's file (scripts/auth-check.sh).
+auth-check:
+	@KUBECTL="$(KUBECTL)" sh scripts/auth-check.sh
+
+
+# The same calls the chat page makes, through the platform API (be_service),
+# for the user of TOKEN (make token).
+AUTH = -H "Authorization: Bearer $(TOKEN)"
+need-token = @test -n "$(TOKEN)" || { echo 'set TOKEN first: export TOKEN=$$(make -s token EMAIL=you@example.org)'; exit 1; }
+
 upload:
 	@test -n "$(FILE)" || { echo "usage: make upload FILE=path/to/notes.md"; exit 1; }
-	@curl -sS --data-binary @$(FILE) --url-query "name=$(notdir $(FILE))" http://127.0.0.1:9001/api/files; echo
+	$(need-token)
+	@curl -sS $(AUTH) --data-binary @$(FILE) --url-query "name=$(notdir $(FILE))" http://127.0.0.1:9001/api/files; echo
 
 files:
-	@curl -sS http://127.0.0.1:9001/api/files; echo
+	$(need-token)
+	@curl -sS $(AUTH) http://127.0.0.1:9001/api/files; echo
 
 # Documents read from the files: a preprint and the published version of a
 # paper are one document with two files.
 documents:
-	@curl -sS http://127.0.0.1:9001/api/documents; echo
+	$(need-token)
+	@curl -sS $(AUTH) http://127.0.0.1:9001/api/documents; echo
 
 # Every uploaded file through Index again, one by one: chunks, and the steps
 # added to Index since the file came (the document read from it).
 reindex-all:
-	@curl -sS http://127.0.0.1:9001/api/files | jq -r '.[].file_id' | while read -r id; do \
-	  curl -sS -X POST http://127.0.0.1:9001/api/files/$$id/index; echo; \
+	$(need-token)
+	@curl -sS $(AUTH) http://127.0.0.1:9001/api/files | jq -r '.[].file_id' | while read -r id; do \
+	  curl -sS $(AUTH) -X POST http://127.0.0.1:9001/api/files/$$id/index; echo; \
 	done
 
 # Without CHAT a new chat starts and its id is printed; with it the question
 # goes on in that chat, so the answer can build on the earlier ones.
 chat:
 	@test -n "$(Q)" || { echo 'usage: make chat Q="question" [CHAT=<chat_id>]'; exit 1; }
+	$(need-token)
 	@chat="$(CHAT)"; \
-	if [ -z "$$chat" ]; then chat=$$(curl -sS -X POST http://127.0.0.1:9001/api/chats | jq -r .chat_id); echo "CHAT=$$chat"; fi; \
+	if [ -z "$$chat" ]; then chat=$$(curl -sS $(AUTH) -X POST http://127.0.0.1:9001/api/chats | jq -r .chat_id); echo "CHAT=$$chat"; fi; \
 	jq -n --arg text "$(Q)" '{text: $$text}' \
-	  | curl -sS -H 'content-type: application/json' --data-binary @- http://127.0.0.1:9001/api/chats/$$chat/messages \
+	  | curl -sS $(AUTH) -H 'content-type: application/json' --data-binary @- http://127.0.0.1:9001/api/chats/$$chat/messages \
 	  | jq -r 'if .error then "error: \(.error)" else "\(.text)\n\nturn \(.turn), sources: \([.sources[] | "\(.name)#\(.chunk_id)"] | join(", "))" end'
 
 # The chat product. The kind cluster maps no host port for it (a new mapping

@@ -14,6 +14,32 @@ variable "platform_api_url" {
   type        = string
 }
 
+variable "public_origins" {
+  description = "Origins (scheme://host:port) the page is served from."
+  type        = list(string)
+}
+
+variable "db" {
+  description = "Its own database and owner role (output of postgres-database), migrated before it starts."
+  type = object({
+    host     = string
+    port     = number
+    database = string
+    user     = string
+  })
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "token_private_key" {
+  description = "PEM private key (Ed25519, PKCS#8) the platform token of a user is signed with."
+  type        = string
+  sensitive   = true
+}
+
 variable "node_selector" {
   description = "Where the service runs."
   type        = map(string)

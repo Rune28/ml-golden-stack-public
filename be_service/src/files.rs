@@ -82,6 +82,36 @@ pub async fn delete(parts: &impl FileParts, file_id: &str) -> Result<()> {
     parts.delete_file_row(file_id).await
 }
 
+/// The owner links of files; a fake implements it in tests.
+pub trait FileOwners {
+    async fn remove_owner(&self, user: &str, file_id: &str) -> Result<()>;
+    async fn owner_count(&self, file_id: &str) -> Result<u64>;
+}
+
+/// A user deletes a file: their link goes, and the file with everything made
+/// from it goes when no other user has it (`delete`). True when it went.
+/// The link goes first: if the deletion of the rest fails, the file is no
+/// longer the user's, and the next deletion by its last owner finishes it.
+/// Known race: a second user uploading the same bytes between the count and
+/// the deletion gets a link to a file being deleted, and uploads it again.
+pub async fn remove(owners: &impl FileOwners, parts: &impl FileParts, user: &str, file_id: &str) -> Result<bool> {
+    owners.remove_owner(user, file_id).await?;
+    if owners.owner_count(file_id).await? > 0 {
+        return Ok(false);
+    }
+    delete(parts, file_id).await?;
+    Ok(true)
+}
+
+impl FileOwners for Stores<'_> {
+    async fn remove_owner(&self, user: &str, file_id: &str) -> Result<()> {
+        self.store.remove_owner(user, file_id).await
+    }
+    async fn owner_count(&self, file_id: &str) -> Result<u64> {
+        self.store.owner_count(file_id).await
+    }
+}
+
 /// The ClickHouse tables and the bucket of the platform, as one FileParts.
 pub struct Stores<'a> {
     pub store: &'a ClickHouse,
@@ -216,6 +246,51 @@ mod tests {
 
         delete(&parts, "abc").await.unwrap();
         assert_eq!(parts.calls.borrow().last().unwrap(), "row abc");
+    }
+
+    /// Owner links in memory, recording into the same calls as FakeParts.
+    struct FakeOwners<'a> {
+        parts: &'a FakeParts,
+        owners: RefCell<Vec<(String, String)>>,
+    }
+
+    impl FileOwners for FakeOwners<'_> {
+        async fn remove_owner(&self, user: &str, file_id: &str) -> Result<()> {
+            self.owners.borrow_mut().retain(|(u, f)| !(u == user && f == file_id));
+            self.parts.calls.borrow_mut().push(format!("unlink {user} {file_id}"));
+            Ok(())
+        }
+        async fn owner_count(&self, file_id: &str) -> Result<u64> {
+            Ok(self.owners.borrow().iter().filter(|(_, f)| f == file_id).count() as u64)
+        }
+    }
+
+    fn owned_by<'a>(parts: &'a FakeParts, users: &[&str]) -> FakeOwners<'a> {
+        FakeOwners { parts, owners: RefCell::new(users.iter().map(|u| (u.to_string(), "abc".into())).collect()) }
+    }
+
+    #[tokio::test]
+    async fn the_last_owner_deletes_the_file_and_everything_made_from_it() {
+        let parts = FakeParts::new(None);
+        let owners = owned_by(&parts, &["ann"]);
+
+        assert!(remove(&owners, &parts, "ann", "abc").await.unwrap());
+
+        assert_eq!(
+            *parts.calls.borrow(),
+            ["unlink ann abc", "markers abc", "derived abc", "chunks abc", "object files/abc", "row abc"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_who_is_not_the_last_removes_only_their_link() {
+        let parts = FakeParts::new(None);
+        let owners = owned_by(&parts, &["ann", "bob"]);
+
+        assert!(!remove(&owners, &parts, "bob", "abc").await.unwrap());
+
+        assert_eq!(*parts.calls.borrow(), ["unlink bob abc"]);
+        assert_eq!(owners.owners.borrow().as_slice(), [("ann".to_owned(), "abc".to_owned())]);
     }
 
     #[test]

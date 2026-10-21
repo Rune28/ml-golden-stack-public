@@ -55,6 +55,8 @@ resource "helm_release" "this" {
         TEMPORAL_NAMESPACE  = "default"
         MLFLOW_URL          = var.mlflow_tracking_uri
         S3_BUCKET           = var.s3.bucket
+        # Not a secret: it checks tokens and cannot make one.
+        PLATFORM_TOKEN_PUBLIC_KEY = var.token_public_key
       },
       var.s3.endpoint == null ? {} : { AWS_ENDPOINT_URL_S3 = var.s3.endpoint },
     )

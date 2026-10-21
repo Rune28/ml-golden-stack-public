@@ -38,19 +38,24 @@ class Chatter:
         file. Only chunks of the model the question is embedded with: vectors
         of different models are never compared. Only chunks of files that
         exist: an index committed after its file was deleted stays unseen.
-        One text once: the same paragraph in two files takes one place."""
+        One text once: the same paragraph in two files takes one place.
+        Only the user's files, through the views of what they may see; with
+        no user, nothing (fail closed)."""
+        if not input.user_id:
+            return []
         [vector] = self.llm.embed([input.question])
         rows = self.connect().query(
             "SELECT c.file_id, c.run_id, c.chunk_id, f.name, cosineDistance(c.embedding, {q:Array(Float32)}) AS distance "
-            "FROM doc_chunks_current AS c INNER JOIN (SELECT file_id, name FROM files FINAL) AS f ON f.file_id = c.file_id "
+            "FROM doc_chunks_visible(user_id = {u:String}) AS c "
+            "INNER JOIN (SELECT file_id, name FROM files_visible(user_id = {u:String})) AS f ON f.file_id = c.file_id "
             "WHERE c.embed_model = {m:String} ORDER BY distance LIMIT 1 BY cityHash64(c.text) LIMIT {k:UInt32}",
-            parameters={"q": vector, "m": self.llm.embed_model, "k": input.k},
+            parameters={"q": vector, "m": self.llm.embed_model, "k": input.k, "u": input.user_id},
         ).result_rows
         return [Source(file_id=f, index_run_id=r, chunk_id=c, name=n, distance=float(d)) for f, r, c, n, d in rows]
 
     @activity.defn(name="generate")
     def generate(self, input: GenerateInput) -> Generated:
-        texts = self.read_chunks(input.sources)
+        texts = self.read_chunks(input.sources, input.user_id)
         context = "\n\n".join(
             f"[{i}] {s.name}\n{texts.get((s.index_run_id, s.chunk_id), '')}" for i, s in enumerate(input.sources, 1)
         ) or "(no documents)"
@@ -63,14 +68,17 @@ class Chatter:
         log.info("answered with %d sources, %d tokens, model %s", len(input.sources), reply.completion_tokens, reply.model)
         return Generated(text=reply.text.strip(), model=reply.model)
 
-    def read_chunks(self, sources: list[Source]) -> dict[tuple[str, int], str]:
-        """Texts by key, from the table and not the view: a run's chunks never
-        change, and a newer index committed since retrieve must not hide them."""
-        if not sources:
+    def read_chunks(self, sources: list[Source], user_id: str) -> dict[tuple[str, int], str]:
+        """Texts by key, of every index run and not only the current one: a
+        run's chunks never change, and a newer index committed since retrieve
+        must not hide them. Only of the user's files: a key of someone else's
+        chunk reads nothing."""
+        if not sources or not user_id:
             return {}
         rows = self.connect().query(
-            "SELECT run_id, chunk_id, text FROM doc_chunks WHERE (run_id, chunk_id) IN {keys:Array(Tuple(String, UInt32))}",
-            parameters={"keys": [(s.index_run_id, s.chunk_id) for s in sources]},
+            "SELECT run_id, chunk_id, text FROM doc_chunks_owned(user_id = {u:String}) "
+            "WHERE (run_id, chunk_id) IN {keys:Array(Tuple(String, UInt32))}",
+            parameters={"keys": [(s.index_run_id, s.chunk_id) for s in sources], "u": user_id},
         ).result_rows
         return {(r, c): t for r, c, t in rows}
 

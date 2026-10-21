@@ -18,14 +18,15 @@ class FakeClickHouse:
 
     def query(self, sql, parameters):
         self.queries.append(sql)
-        if "FROM chunk_mentions_current" in sql:
+        assert parameters.get("u") == "ann", f"a read without the user: {sql}"
+        if "FROM chunk_mentions_visible" in sql:
             rows = [m for m in self.mentions if m[0] in parameters["t"]]
-        elif "FROM term_vectors_current" in sql:
+        elif "FROM term_vectors_visible" in sql:
             close = sorted((d, t) for t, d in self.vectors if t != parameters["t"] and d <= parameters["d"])
             rows = [[t, d] for d, t in close][: parameters["n"]]
-        elif "FROM document_themes_current" in sql:
+        elif "FROM document_themes_visible" in sql:
             rows = [t for t in self.themes if t[0] in parameters["t"]]
-        elif "FROM files FINAL WHERE" in sql:
+        elif "FROM files_visible(user_id = {u:String}) WHERE" in sql:
             rows = [[f, f"{f}.txt"] for f in parameters["f"]]
         elif "cosineDistance" in sql:  # the closest: here, the first n keys
             rows = [[f"f-{r}", r, c] for r, c in parameters["k"][: parameters["n"]]]
@@ -51,7 +52,8 @@ class FakeLLM:
 def gather(clickhouse, terms, question="q", min_chunks=1, llm=None):
     """By default any number of chunks is a topic: the tests of which chunks are taken use a few."""
     steps = TopicSteps(lambda: clickhouse, llm or FakeLLM())
-    return ActivityEnvironment().run(steps.gather, GatherInput(question=question, terms=terms, min_chunks=min_chunks))
+    return ActivityEnvironment().run(steps.gather, GatherInput(question=question, terms=terms, min_chunks=min_chunks,
+                                                                user_id="ann"))
 
 
 def test_route_reads_a_short_query_then_the_kind_and_its_terms():
@@ -202,7 +204,7 @@ def test_more_chunks_than_an_answer_reads_are_cut_to_the_closest():
     assert gathered.found == topics.MAX_CHUNKS + 10 and len(gathered.sources) == topics.MAX_CHUNKS
     # The workflow can ask for fewer.
     steps = TopicSteps(lambda: FakeClickHouse(mentions=mentions), FakeLLM())
-    few = ActivityEnvironment().run(steps.gather, GatherInput(question="q", terms=["смерть"], max_chunks=5))
+    few = ActivityEnvironment().run(steps.gather, GatherInput(question="q", terms=["смерть"], max_chunks=5, user_id="ann"))
     assert len(few.sources) == 5
 
 
@@ -222,7 +224,7 @@ def test_summarize_takes_notes_then_themes_then_a_paragraph_per_theme(monkeypatc
     env.on_heartbeat = lambda *d: beats.append(d[0])
 
     generated = env.run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
-                        SummarizeInput(question="о смерти?", sources=sources))
+                        SummarizeInput(question="о смерти?", sources=sources, user_id="ann"))
 
     map_one, map_two, themes, first, _, second = llm.prompts
     assert "[1] book.txt\ntext 0" in map_one[1]["content"] and "[3] book.txt\ntext 2" in map_two[1]["content"]
@@ -246,7 +248,7 @@ def test_notes_too_many_for_one_call_are_condensed_first(monkeypatch):
     ])
 
     generated = ActivityEnvironment().run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
-                                          SummarizeInput(question="q", sources=sources))
+                                          SummarizeInput(question="q", sources=sources, user_id="ann"))
 
     assert "Merge the notes" in llm.prompts[1][0]["content"] and llm.prompts[1][1]["content"] == f"[1] {'a' * 30}"
     assert llm.prompts[3][0]["content"].endswith("[1] short a\n[2] short b")
@@ -259,7 +261,8 @@ def test_notes_are_taken_on_the_message_and_themes_named_after_the_query():
 
     generated = ActivityEnvironment().run(
         TopicSteps(lambda: FakeClickHouse(), llm).summarize,
-        SummarizeInput(question="Вопрос про сон. Сначала ты летишь", sources=sources, query="меняет ли сон?"))
+        SummarizeInput(question="Вопрос про сон. Сначала ты летишь", sources=sources, query="меняет ли сон?",
+                       user_id="ann"))
 
     map_, themes, paragraph = llm.prompts
     assert "Сначала ты летишь" in map_[0]["content"]
@@ -284,7 +287,7 @@ def test_the_question_never_reaches_the_steps_that_write_from_notes(monkeypatch)
     ])
 
     ActivityEnvironment().run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
-                              SummarizeInput(question=question, sources=sources))
+                              SummarizeInput(question=question, sources=sources, user_id="ann"))
 
     _, condense_one, condense_two, themes, paragraph = llm.prompts
     assert question in themes[0]["content"]  # themes are chosen to answer it
@@ -317,7 +320,7 @@ def test_when_no_passage_says_anything_there_is_no_answer_to_combine():
     llm = FakeLLM(answers=[{"notes": []}])
 
     generated = ActivityEnvironment().run(TopicSteps(lambda: FakeClickHouse(), llm).summarize,
-                                          SummarizeInput(question="о квазарах?", sources=sources))
+                                          SummarizeInput(question="о квазарах?", sources=sources, user_id="ann"))
 
     assert generated.text == "" and len(llm.prompts) == 1
 
@@ -334,3 +337,23 @@ def test_notes_are_read_in_the_order_of_the_passages_and_cut_at_the_limit():
 
     assert render_notes(notes) == f"[1] {'a' * 10}\n[2] {'b' * 10}\n[3] {'c' * 10}"
     assert render_notes(notes, limit=30) == f"[1] {'a' * 10}\n[2] {'b' * 10}"
+
+
+def test_gather_without_a_user_reads_nothing():
+    clickhouse = FakeClickHouse(mentions=[("смерть", "book", "idx", 7)])
+    steps = TopicSteps(lambda: clickhouse, FakeLLM())
+
+    gathered = ActivityEnvironment().run(steps.gather, GatherInput(question="q", terms=["смерть"]))
+
+    assert gathered.mode == "none" and clickhouse.queries == []
+
+
+def test_summarize_without_a_user_reads_no_texts():
+    clickhouse = FakeClickHouse(texts={0: "a passage of someone else"})
+    llm = FakeLLM(answers=[{"notes": []}])
+    sources = [Source(file_id="b", index_run_id="i", chunk_id=0, name="book.txt")]
+
+    ActivityEnvironment().run(TopicSteps(lambda: clickhouse, llm).summarize, SummarizeInput(question="q", sources=sources))
+
+    assert clickhouse.queries == []
+    assert all("someone else" not in m["content"] for prompt in llm.prompts for m in prompt)

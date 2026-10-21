@@ -149,6 +149,7 @@ impl Temporal {
         chat_id: &str,
         run_id: &str,
         text: &str,
+        user_id: &str,
     ) -> Result<serde_json::Value, UpdateError> {
         let client = self.client().await.map_err(UpdateError::Other)?;
         let options = WorkflowUpdateWithStartOptions::new(
@@ -160,7 +161,7 @@ impl Temporal {
         .rpc_options(RpcOptions::builder().timeout(UPDATE_POLL_TIMEOUT).build())
         .build();
         let input = serde_json::json!({ "chat_id": chat_id });
-        let message = serde_json::json!({ "text": text, "run_id": run_id });
+        let message = serde_json::json!({ "text": text, "run_id": run_id, "user_id": user_id });
         let result = client
             .execute_update_with_start_workflow(
                 UntypedWorkflow::new("Chat"),

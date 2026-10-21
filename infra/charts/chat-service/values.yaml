@@ -3,8 +3,10 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-# Settings (the platform API URL): a ConfigMap created next to the release.
+# Settings (the platform API, the database, the page's origins): a ConfigMap
+# created next to the release; the database password: a Secret.
 configMap: chat-service
+secret: ""
 
 service:
   type: ClusterIP
@@ -15,7 +17,8 @@ replicas: 1
 podAnnotations: {}
 nodeSelector: {}
 
-# Holds at most one upload (up to 10 MiB) per request on its way to the platform.
+# Holds at most one upload (up to 10 MiB) per request on its way to the
+# platform, and argon2id takes 19 MiB per login being checked.
 resources:
-  requests: { cpu: 20m, memory: 32Mi }
-  limits: { memory: 96Mi }
+  requests: { cpu: 20m, memory: 48Mi }
+  limits: { memory: 160Mi }

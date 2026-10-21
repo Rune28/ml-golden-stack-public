@@ -114,14 +114,14 @@ class ChatWorkflow:
         story found the passages on dreams of cities and houses."""
         sources = await workflow.execute_activity(
             RETRIEVE,
-            RetrieveInput(question=message.text),
+            RetrieveInput(question=message.text, user_id=message.user_id),
             result_type=list[Source],
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RETRY,
         )
         generated = await workflow.execute_activity(
             GENERATE,
-            GenerateInput(question=message.text, sources=sources, history=self.history),
+            GenerateInput(question=message.text, sources=sources, history=self.history, user_id=message.user_id),
             result_type=Generated,
             # One answer of a small model on the local GPU, thinking included.
             start_to_close_timeout=timedelta(minutes=5),
@@ -137,7 +137,7 @@ class ChatWorkflow:
         query = route.query or message.text
         gathered = await workflow.execute_activity(
             GATHER, GatherInput(question=query, terms=route.terms, max_chunks=self.max_topic_chunks,
-                                min_chunks=self.min_topic_chunks),
+                                min_chunks=self.min_topic_chunks, user_id=message.user_id),
             result_type=Gathered,
             start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
         )
@@ -147,7 +147,8 @@ class ChatWorkflow:
         if gathered.mode != "chunks":
             return None
         generated = await workflow.execute_activity(
-            SUMMARIZE, SummarizeInput(question=message.text, sources=gathered.sources, query=query),
+            SUMMARIZE,
+            SummarizeInput(question=message.text, sources=gathered.sources, query=query, user_id=message.user_id),
             result_type=Generated,
             # A call per group of chunks, one for the themes, one per theme: two or three minutes.
             start_to_close_timeout=timedelta(minutes=15), heartbeat_timeout=timedelta(minutes=2),
