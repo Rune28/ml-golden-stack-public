@@ -4,6 +4,14 @@ Temporal worker of the `llm` task queue: events processed in the worker as they 
 
 `rag` is chunking, PDF text and the keys and metadata of documents, with no I/O (principle 2); `workflow/llm.py` is the adapter to the model server.
 
+## Profiles
+
+What depends on the corpus is a profile, a file in `src/workflow/profiles/` (`rag/profiles.py` says what it holds): what counts as a fact, a topic and a story to interpret, with examples; how to pick the terms; examples and thresholds of synonyms; whose words a passage gives. The steps and the prompt templates in `rag/topics.py` are the same for every corpus.
+
+- A chat's profile is fixed by its first message that names one, or by the default its first route resolved (`LLM_DEFAULT_PROFILE`, else `default`). The workflow carries the name; activities read the file. route returns the name and the version (a hash of the file) into the workflow history.
+- The texts go into the prompts exactly as written, line breaks included: for qwen3:4b the layout moved a question between kinds. An edit of a profile is a new version: measure the route on that corpus's control questions (5 runs a question) before the release, as for a prompt in code.
+- The kinds themselves (`KINDS`) are code, not profile: each is a path in the workflow. A new kind is a change to the workflow.
+
 ## Workflows and contracts
 
 - Temporal replays workflow code, so it stays deterministic: I/O, clocks, randomness and environment reads go into activities.

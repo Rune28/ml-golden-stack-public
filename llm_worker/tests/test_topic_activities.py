@@ -2,6 +2,9 @@ from temporalio.testing import ActivityEnvironment
 
 from rag import topics
 from rag.topics import assemble, cites, lemmas, note_batches, notes_from, render_notes, similar_from, themes_from
+from dataclasses import replace
+
+from workflow import profiles
 from workflow.activities import topic as topic_module
 from workflow.activities.topic import TopicSteps
 from workflow.contracts import GatherInput, RouteInput, Source, SummarizeInput
@@ -117,6 +120,32 @@ def test_terms_together_in_too_few_chunks_for_a_topic_give_the_chunks_of_any():
 
     assert [s.chunk_id for s in few.sources] == [1, 2, 3, 7, 8, 9]
     assert [s.chunk_id for s in enough.sources] == [2, 3]
+
+
+def test_route_says_which_profile_and_version_it_read_the_message_with(monkeypatch):
+    monkeypatch.setenv("LLM_DEFAULT_PROFILE", "philosophy")
+    llm = FakeLLM(answers=[{"kind": "fact", "query": "q", "terms": []}] * 2)
+    steps = TopicSteps(lambda: None, llm)
+
+    default = ActivityEnvironment().run(steps.route, RouteInput(question="кто автор?"))
+    named = ActivityEnvironment().run(steps.route, RouteInput(question="кто автор?", profile="default"))
+
+    assert (default.profile, default.profile_version) == ("philosophy", profiles.load("philosophy").version)
+    assert named.profile == "default"
+    assert "Пруст" in llm.prompts[0][0]["content"] and "Пруст" not in llm.prompts[1][0]["content"]
+
+
+def test_how_near_and_how_many_similar_terms_are_the_profile_s(monkeypatch):
+    strict = replace(profiles.load("default"), similar_max_distance=0.2, similar_candidates=1)
+    monkeypatch.setattr(topic_module, "load", lambda name: strict)
+    clickhouse = FakeClickHouse(mentions=[("сон", "b", "i", 1)],
+                                vectors=[("сновидение", 0.15), ("эротический сон", 0.18), ("мечтание", 0.22)])
+    llm = FakeLLM(answers=[{"same": ["сновидение"]}])
+
+    gather(clickhouse, ["сон"], llm=llm)
+
+    [[prompt]] = llm.prompts
+    assert prompt["content"].endswith("Terms:\nсновидение")
 
 
 def test_with_no_stored_term_close_to_a_term_the_model_is_not_asked():

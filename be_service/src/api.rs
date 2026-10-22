@@ -18,6 +18,7 @@ use crate::files::{self, ObjectStore};
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
+use crate::profiles::Profiles;
 use crate::store::{
     Batch, ChatSummary, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, DocumentRow, PredictionRun, Stats,
 };
@@ -39,6 +40,8 @@ pub struct AppState {
     pub objects: ObjectStore,
     /// Checks the platform token of the product routes (files, documents, chats).
     pub verifier: Verifier,
+    /// The profiles a chat may name, and the default.
+    pub profiles: Profiles,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -59,6 +62,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/documents", get(list_documents))
         .route("/api/chats", post(new_chat).get(list_chats))
         .route("/api/chats/{chat_id}/messages", post(send_message).get(chat_history))
+        .route("/api/profiles", get(list_profiles))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -443,14 +447,26 @@ async fn chat_history(
     Ok(Json(messages))
 }
 
+/// The profiles a new chat may name, and the one it gets naming none:
+/// `{"profiles": ["philosophy", "default"], "default": "philosophy"}`.
+async fn list_profiles(State(state): State<Arc<AppState>>, User(_): User) -> Json<Value> {
+    Json(json!({ "profiles": state.profiles.names, "default": state.profiles.default }))
+}
+
 #[derive(Deserialize)]
 struct MessageRequest {
     text: String,
+    /// The profile of the corpus (llm_worker/src/workflow/profiles): what
+    /// counts as which kind of question, which words are synonyms. Empty: the
+    /// worker's default. The first message that names one fixes it for the chat.
+    #[serde(default)]
+    profile: String,
 }
 
 /// One message of a chat, answered from the uploaded files:
-/// `POST /api/chats/<chat_id>/messages` with `{"text": "..."}`. Waits for the
-/// answer: seconds to a minute for a small model on the local GPU.
+/// `POST /api/chats/<chat_id>/messages` with `{"text": "...", "profile": "..."}`,
+/// the profile optional. Waits for the answer: seconds to a minute for a small
+/// model on the local GPU.
 ///
 /// The chat must be the user's. The user_id goes with the message to the
 /// workflow, and every step of the answer reads only the user's files with
@@ -466,12 +482,15 @@ async fn send_message(
     if text.is_empty() || text.chars().count() > MAX_MESSAGE_CHARS {
         return Err(ApiError::BadRequest(format!("text: 1-{MAX_MESSAGE_CHARS} characters")));
     }
+    if let Some(refused) = state.profiles.refusal(&req.profile) {
+        return Err(ApiError::BadRequest(refused));
+    }
     if !state.store.visible(&user).owns_chat(&chat_id).await? {
         return Err(ApiError::NotFound(format!("no chat {chat_id}")));
     }
     // The answer's run, made where the request enters the platform (principle 5).
     let run_id = uuid::Uuid::now_v7().to_string();
-    match state.temporal.send_message(&chat_id, &run_id, text, &user).await {
+    match state.temporal.send_message(&chat_id, &run_id, text, &user, &req.profile).await {
         Ok(answer) => Ok(Json(answer)),
         Err(UpdateError::Failed(message)) => Err(ApiError::Upstream(message)),
         Err(UpdateError::Other(e)) => Err(ApiError::Internal(e)),
@@ -676,6 +695,7 @@ mod tests {
             ingest_lock: Mutex::default(),
             objects: ObjectStore::new("http://127.0.0.1:9", "pipeline", "key", "secret").unwrap(),
             verifier: Verifier::from_pem(crate::auth::tests::PUBLIC).unwrap(),
+            profiles: Profiles::new(vec!["philosophy".into(), "default".into()], "philosophy".into()).unwrap(),
         }))
     }
 
@@ -731,6 +751,20 @@ mod tests {
         assert_eq!(message("chat-1", &long).await, StatusCode::BAD_REQUEST);
         assert_eq!(message("a%20b", r#"{"text": "hi"}"#).await, StatusCode::BAD_REQUEST);
         assert_eq!(message("chat-1", r#"{}"#).await, StatusCode::UNPROCESSABLE_ENTITY);
+        for profile in ["../secrets", "fitness"] {
+            let body = serde_json::json!({ "text": "hi", "profile": profile }).to_string();
+            assert_eq!(message("chat-1", &body).await, StatusCode::BAD_REQUEST, "{profile}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_the_profiles_a_new_chat_may_name() {
+        let req = Request::get("/api/profiles").header("authorization", bearer()).body(Body::empty()).unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed, serde_json::json!({ "profiles": ["philosophy", "default"], "default": "philosophy" }));
     }
 
     #[tokio::test]
@@ -765,6 +799,7 @@ mod tests {
             ("POST", "/api/chats"),
             ("GET", "/api/chats/c-1/messages"),
             ("POST", "/api/chats/c-1/messages"),
+            ("GET", "/api/profiles"),
         ] {
             for auth in [None, Some("Bearer not-a-token".to_owned()), Some(format!("Bearer {expired}"))] {
                 let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");

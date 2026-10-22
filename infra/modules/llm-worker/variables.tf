@@ -41,11 +41,12 @@ variable "s3_secret_key" {
 }
 
 variable "llm" {
-  description = "The model server (base_url of an OpenAI-compatible API) and the models on it."
+  description = "The model server (base_url of an OpenAI-compatible API), the models on it, and the profile of a chat that names none (a file in llm_worker/src/workflow/profiles)."
   type = object({
-    base_url    = string
-    chat_model  = string
-    embed_model = string
+    base_url        = string
+    chat_model      = string
+    embed_model     = string
+    default_profile = optional(string, "default")
   })
 }
 

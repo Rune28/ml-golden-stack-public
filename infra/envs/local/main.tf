@@ -146,9 +146,10 @@ module "llm_worker" {
   node_selector = local.platform_node_selector
 
   llm = {
-    base_url    = module.llm.base_url
-    chat_model  = var.llm_chat_model
-    embed_model = var.llm_embed_model
+    base_url        = module.llm.base_url
+    chat_model      = var.llm_chat_model
+    embed_model     = var.llm_embed_model
+    default_profile = var.llm_default_profile
   }
 
   depends_on = [module.clickhouse_migrate]
@@ -191,6 +192,11 @@ module "be_service" {
   }
   node_selector    = local.platform_node_selector
   token_public_key = tls_private_key.platform_token.public_key_pem
+  # The same default as the llm worker's: the page shows it chosen on a new chat.
+  profiles = {
+    names   = var.llm_profiles
+    default = var.llm_default_profile
+  }
 
   depends_on = [module.clickhouse_migrate]
 }

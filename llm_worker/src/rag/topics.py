@@ -6,11 +6,22 @@ A question about a fact ("what is a transworld line?") is answered from the
 few chunks closest to it. A question about a topic ("what does the book say
 about death?") needs every chunk the topic is a keyword of, summarized a
 group at a time and then together (map-reduce).
+
+The prompts here are templates: what depends on the corpus (what counts as
+which kind of message, examples of synonyms, whose words a passage gives)
+comes from its profile (rag.profiles), filled in by route_prompt,
+similar_prompt and map_prompt.
 """
 
+from __future__ import annotations
+
 import re
+from typing import TYPE_CHECKING
 
 from rag.mentions import candidates
+
+if TYPE_CHECKING:  # rag.profiles imports KINDS from here
+    from rag.profiles import Profile
 
 # Chunks one topic answer reads by default; more are ranked by closeness to
 # the question. The workflow passes its own (principle 7). At 60 every
@@ -39,11 +50,9 @@ KINDS = ("fact", "topic", "interpret")
 # The model writes the fields in this order. The kind first, off the whole
 # message: written after the query, it was read off a short question and a
 # dream went the other way 3 times of 5. Then the query, then the terms off
-# the query, not off the story. Without the examples and "in Russian", the
-# query came in English 4 times of 6, and the terms named only the author
-# ("Пруст", a theme of the whole book: too broad to gather). Measured on
-# qwen3:4b, 2026-10-21: five messages about the user's dreams and seven
-# control questions, each kind right 5 times of 5.
+# the query, not off the story. Without "in Russian", the query came in
+# English 4 times of 6. What counts as which kind, with examples, is the
+# profile's: the measurements of its examples are in its file.
 ROUTE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -54,47 +63,46 @@ ROUTE_SCHEMA = {
     "required": ["kind", "query", "terms"],
 }
 
-ROUTE_PROMPT = """You decide how to answer a message about the user's documents. Return JSON.
+# The kinds are listed with the one the model confused most first.
+ROUTE_TEMPLATE = """You decide how to answer a message about the user's documents. Return JSON.
 - kind, one of three:
-  interpret: the user tells their own story, dream, experience or thought and asks what it means or how to
-  understand it ("как бы ты описал этот сон? мне снилось, что…", "то есть во сне отыгрывается страх?").
-  topic: the user asks what the documents or an author say about a subject, gathered from many passages
-  ("что Пруст говорит о смерти?", "что автор имел в виду под топологией пути?", "как Мамардашвили понимает любовь?").
-  fact: a definition, a name, a date, a detail ("что такое трансмировая линия?", "кто автор книги?").
+  interpret: {interpret}
+  topic: {topic}
+  fact: {fact}
 - query: what the message asks of the documents, as one short question in the language of the message
   (a message in Russian gets a query in Russian), at most 20 words: the subject and what is asked about it,
   without the story or the examples around it.
-- terms: at most 3 words of the query, as written there: the subject asked about first (смерть, любовь,
-  сон), then a name or a word that narrows it (Пруст). Never only a name: "что Пруст говорит о смерти?"
-  gives смерти, Пруст."""
+- terms: at most 3 words of the query, as written there: {terms}"""
+
+
+def route_prompt(profile: Profile) -> str:
+    return ROUTE_TEMPLATE.format(**profile.kinds, terms=profile.terms)
+
 
 # A term of the question also gathers the stored terms close to it: "сон" is a
-# keyword of 3 chunks of a book, "сновидение" of 5 more. The closest are
-# candidates and the chat model picks the ones that name the same subject.
-SIMILAR_CANDIDATES = 15
-# Cosine distance (1 - similarity) of bge-m3; farther terms are not even
-# candidates. The model let through what was close enough to be offered: at
-# 0.4, сон → соната (0.36), просыпание (0.33), бодрствование (0.38) and
-# транссибирская магистраль → трансмировая линия (0.34). Synonyms measured
-# within 0.3: сон → сновидение 0.22, мечтание 0.28; личность → индивидуальность
-# 0.23; изменение → преобразование 0.25; страх → ужас 0.28. Lost: изменение →
-# превращение 0.32.
-SIMILAR_MAX_DISTANCE = 0.3
-
+# keyword of 3 chunks of a book, "сновидение" of 5 more. The closest by vector
+# (within the profile's similar_max_distance, at most similar_candidates of
+# them) are candidates, and the chat model picks the ones that name the same
+# subject.
 SIMILAR_SCHEMA = {
     "type": "object",
     "properties": {"same": {"type": "array", "items": {"type": "string"}}},
     "required": ["same"],
 }
 
-SIMILAR_PROMPT = """The user asks about a subject named by the term «{term}». Question: {query}
+SIMILAR_TEMPLATE = """The user asks about a subject named by the term «{term}». Question: {query}
 Below are terms found in the user's documents. Return the ones that name the same subject: a synonym,
-another form of the word, or a kind of it (for «сон»: сновидение, тяжёлый сон). Leave out terms that are
-only related to it (for «сон»: пробуждение, ночь), that sound alike, or that name something else.
+another form of the word, or a kind of it ({same}). Leave out terms that are
+only related to it ({related}), that sound alike, or that name something else.
 Return the terms exactly as written; an empty list if none.
 
 Terms:
 {candidates}"""
+
+
+def similar_prompt(profile: Profile, term: str, query: str, candidates: list[str]) -> str:
+    return SIMILAR_TEMPLATE.format(term=term, query=query, same=profile.similar_same,
+                                   related=profile.similar_related, candidates="\n".join(candidates))
 
 # Map and reduce answer in JSON: a schema makes the model write the answer
 # from its first token, so qwen3 does not think first. In free text it
@@ -116,13 +124,16 @@ MAP_SCHEMA = {
     "required": ["notes"],
 }
 
-MAP_PROMPT = """You read numbered passages from the user's documents and write down what they say
+MAP_TEMPLATE = """You read numbered passages from the user's documents and write down what they say
 about the question below: one short note per point, with the number of its passage.
 Use only the passages; an empty list if none of them says anything about it.
-Passages often quote other authors: say whose words a point is ("Proust writes that..."), and never
-write the "I" of a quote as your own. Write the notes in the language of the question.
+{attribution} Write the notes in the language of the question.
 
 Question: {question}"""
+
+
+def map_prompt(profile: Profile, question: str) -> str:
+    return MAP_TEMPLATE.format(attribution=profile.attribution, question=question)
 
 # Reduce in steps: themes first, then a paragraph per theme. One call asked
 # to group the notes and write the whole answer gave either a paragraph per

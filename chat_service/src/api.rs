@@ -52,6 +52,7 @@ pub fn router<S: AuthStore>(app: Arc<App<S>>) -> Router {
         .route("/api/documents", get(list_documents::<S>))
         .route("/api/chats", get(list_chats::<S>).post(new_chat::<S>))
         .route("/api/chats/{chat_id}/messages", get(chat_history::<S>).post(send_message::<S>))
+        .route("/api/profiles", get(list_profiles::<S>))
         .route("/healthz", get(|| async { "ok" }))
         .layer(middleware::from_fn_with_state(app.clone(), login::guard::<S>))
         .with_state(app)
@@ -82,6 +83,14 @@ async fn upload_file<S: AuthStore>(
 fn refuse_path_id(field: &str, id: &str) -> Option<Response> {
     let well_formed = (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     (!well_formed).then(|| platform::error(StatusCode::BAD_REQUEST, format!("{field}: 1-64 letters, digits or '-'")))
+}
+
+/// The profiles a new chat may name, and the default: the platform's list.
+async fn list_profiles<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+) -> Response {
+    app.platform.call(session.user.user_id, Method::GET, "/api/profiles", &[], None, QUICK).await
 }
 
 async fn list_documents<S: AuthStore>(
@@ -188,6 +197,10 @@ mod tests {
                 .route(
                     "/api/files",
                     post(|| async { (StatusCode::CONFLICT, Json(json!({ "error": "already indexing" }))) }),
+                )
+                .route(
+                    "/api/profiles",
+                    get(|| async { Json(json!({ "profiles": ["philosophy"], "default": "philosophy" })) }),
                 ),
         )
         .await;
@@ -195,6 +208,15 @@ mod tests {
         let (status, answer) = call(&url, post_json("/api/chats/c-1/messages", r#"{"text":"hi"}"#)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(answer, json!({ "chat": "c-1", "got": r#"{"text":"hi"}"# }));
+
+        // The profile of a new chat goes in the body as it came; the platform checks it.
+        let body = r#"{"text":"hi","profile":"philosophy"}"#;
+        let (_, answer) = call(&url, post_json("/api/chats/c-1/messages", body)).await;
+        assert_eq!(answer["got"], json!(body));
+
+        let profiles = Request::get("/api/profiles").body(HttpBody::empty()).unwrap();
+        let (status, listed) = call(&url, profiles).await;
+        assert_eq!((status, listed), (StatusCode::OK, json!({ "profiles": ["philosophy"], "default": "philosophy" })));
 
         let (status, error) = call(&url, post_json("/api/files?name=a.md", "text")).await;
         assert_eq!((status, error), (StatusCode::CONFLICT, json!({ "error": "already indexing" })));

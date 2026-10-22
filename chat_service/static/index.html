@@ -29,6 +29,7 @@
   button.plain { background: transparent; color: var(--accent); border: 1px solid var(--line); }
   button:disabled { opacity: .45; cursor: default; }
   input[type=file] { max-width: 100%; color: var(--muted); }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; font: inherit; }
   textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px; font: inherit; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 12px; }
   td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
@@ -109,7 +110,14 @@
   <section class="card">
     <div class="row" style="justify-content: space-between">
       <h2 style="margin: 0">Chat</h2>
-      <button class="plain" id="new-chat">New chat</button>
+      <div class="row">
+        <!-- A new chat only: its first message fixes the profile for the chat. -->
+        <label class="row" id="profile-picker" hidden>
+          <span class="status" style="margin: 0">Profile</span>
+          <select id="profile" title="What counts as which kind of question, and which words are synonyms, in these documents"></select>
+        </label>
+        <button class="plain" id="new-chat">New chat</button>
+      </div>
     </div>
     <div class="status" id="chat-id"></div>
     <div id="messages"><div class="empty">Ask a question about the uploaded files.</div></div>
@@ -125,6 +133,8 @@
 // The open chat is in the address (#chat=<id>): a reload, the back button or
 // a link opens it again, with its history from the platform.
 let chatId = null;
+// The profiles the platform offers a new chat; empty: the worker's default, no choice.
+let profiles = [];
 const $ = (id) => document.getElementById(id);
 
 // One call to this service's API; an answer that is not ok becomes an Error
@@ -240,17 +250,21 @@ async function send() {
   status.className = "status";
   status.textContent = "Thinking… (up to a minute on a local model)";
   try {
+    // The first message of a chat names its profile; later ones could not change it.
+    const body = { text };
     if (!chatId) {
+      if (profiles.length) body.profile = $("profile").value;
       chatId = (await api("POST", "/api/chats")).chat_id;
       $("chat-id").textContent = `chat ${chatId}`;
+      $("profile-picker").hidden = true;
       // Into the address without a hashchange: the chat is open already.
       history.replaceState(null, "", `#chat=${chatId}`);
     }
     addMessage("user", text);
     $("question").value = "";
-    const answer = await api("POST", `/api/chats/${chatId}/messages`, JSON.stringify({ text }), "application/json");
+    const answer = await api("POST", `/api/chats/${chatId}/messages`, JSON.stringify(body), "application/json");
     addMessage("assistant", answer.text, answer.sources);
-    status.textContent = `turn ${answer.turn} · ${answer.model}`;
+    status.textContent = [`turn ${answer.turn}`, answer.model, answer.profile].filter(Boolean).join(" · ");
     refreshChats();
   } catch (e) {
     status.className = "status error";
@@ -276,6 +290,7 @@ async function openChat() {
   status.className = "status";
   status.textContent = "";
   $("chat-id").textContent = chatId ? `chat ${chatId}` : "";
+  $("profile-picker").hidden = Boolean(chatId) || !profiles.length;
   $("messages").replaceChildren(el("div", "empty", "Ask a question about the uploaded files."));
   markCurrentChat();
   if (!chatId) return;
@@ -389,6 +404,24 @@ function showLogin() {
   checkLogin();
 }
 
+// The choice of a new chat, the platform's default chosen. Without the list
+// the chat page still works: the worker's default answers.
+async function refreshProfiles() {
+  try {
+    const listed = await api("GET", "/api/profiles");
+    profiles = listed.profiles || [];
+    $("profile").replaceChildren(...profiles.map((name) => {
+      const option = el("option", "", name);
+      option.value = name;
+      option.selected = name === listed.default;
+      return option;
+    }));
+  } catch {
+    profiles = [];
+  }
+  $("profile-picker").hidden = Boolean(chatId) || !profiles.length;
+}
+
 function showApp(me) {
   shown = "app";
   $("login").hidden = true;
@@ -396,6 +429,7 @@ function showApp(me) {
   $("who").textContent = me.email;
   refreshFiles();
   refreshChats();
+  refreshProfiles();
   openChat();
 }
 

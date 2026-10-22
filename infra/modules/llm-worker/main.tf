@@ -26,14 +26,15 @@ resource "kubernetes_config_map_v1" "env" {
 
   data = merge(
     {
-      CLICKHOUSE_HOST    = var.clickhouse.host
-      CLICKHOUSE_PORT    = tostring(var.clickhouse.http_port)
-      CLICKHOUSE_USER    = var.clickhouse.user
-      S3_BUCKET          = var.s3.bucket
-      AWS_DEFAULT_REGION = "us-east-1"
-      LLM_BASE_URL       = var.llm.base_url
-      LLM_CHAT_MODEL     = var.llm.chat_model
-      LLM_EMBED_MODEL    = var.llm.embed_model
+      CLICKHOUSE_HOST     = var.clickhouse.host
+      CLICKHOUSE_PORT     = tostring(var.clickhouse.http_port)
+      CLICKHOUSE_USER     = var.clickhouse.user
+      S3_BUCKET           = var.s3.bucket
+      AWS_DEFAULT_REGION  = "us-east-1"
+      LLM_BASE_URL        = var.llm.base_url
+      LLM_CHAT_MODEL      = var.llm.chat_model
+      LLM_EMBED_MODEL     = var.llm.embed_model
+      LLM_DEFAULT_PROFILE = var.llm.default_profile
     },
     var.s3.endpoint == null ? {} : { AWS_ENDPOINT_URL_S3 = var.s3.endpoint },
   )

@@ -62,3 +62,12 @@ variable "token_public_key" {
   description = "PEM public key (Ed25519) the platform token of a user is checked with; the issuer (chat_service) holds the private half."
   type        = string
 }
+
+variable "profiles" {
+  description = "Profiles a chat may name (files of the llm worker, llm_worker/src/workflow/profiles) and the default, the same as the worker's. An empty list lets any well-formed name through to the worker."
+  type = object({
+    names   = list(string)
+    default = string
+  })
+  default = { names = [], default = "" }
+}

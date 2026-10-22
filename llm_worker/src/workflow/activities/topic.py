@@ -32,16 +32,11 @@ from rag.mentions import MAX_SHARE
 from rag.topics import (
     CONDENSE_PROMPT,
     KINDS,
-    MAP_PROMPT,
     MAP_SCHEMA,
     MAX_NOTES_CHARS,
     PARAGRAPH_PROMPT,
     PARAGRAPH_SCHEMA,
-    ROUTE_PROMPT,
     ROUTE_SCHEMA,
-    SIMILAR_CANDIDATES,
-    SIMILAR_MAX_DISTANCE,
-    SIMILAR_PROMPT,
     SIMILAR_SCHEMA,
     THEMES_PROMPT,
     THEMES_SCHEMA,
@@ -49,15 +44,20 @@ from rag.topics import (
     cites,
     groups,
     lemmas,
+    map_prompt,
     note_batches,
     notes_from,
     render_notes,
+    route_prompt,
     similar_from,
+    similar_prompt,
     themes_from,
 )
+from rag.profiles import Profile
 from workflow.activities.index import connect
 from workflow.contracts import Broad, Gathered, GatherInput, Generated, Route, RouteInput, Source, SummarizeInput
 from workflow.llm import LLM
+from workflow.profiles import load
 
 log = logging.getLogger(__name__)
 
@@ -73,15 +73,18 @@ class TopicSteps:
 
     @activity.defn(name="route")
     def route(self, input: RouteInput) -> Route:
+        profile = load(input.profile)
         answer = self.llm.chat_json(
-            [{"role": "system", "content": ROUTE_PROMPT}, {"role": "user", "content": input.question}], ROUTE_SCHEMA
+            [{"role": "system", "content": route_prompt(profile)}, {"role": "user", "content": input.question}],
+            ROUTE_SCHEMA,
         )
         terms = [t.strip() for t in answer.get("terms") or [] if isinstance(t, str) and t.strip()][:3]
         kind = answer.get("kind")
         if kind not in KINDS or (kind == "topic" and not terms):
             kind = "fact"
         query = answer.get("query")
-        return Route(kind=kind, terms=terms, query=query.strip() if isinstance(query, str) else "")
+        return Route(kind=kind, terms=terms, query=query.strip() if isinstance(query, str) else "",
+                     profile=profile.name, profile_version=profile.version)
 
     @activity.defn(name="gather")
     def gather(self, input: GatherInput) -> Gathered:
@@ -90,9 +93,9 @@ class TopicSteps:
         # no user, nothing (fail closed).
         if not stored or not input.user_id:
             return Gathered(mode="none")
-        user = input.user_id
+        user, profile = input.user_id, load(input.profile)
         client = self.connect()
-        similar = {t: self.similar(client, t, input.question, user) for t in stored}
+        similar = {t: self.similar(client, t, input.question, user, profile) for t in stored}
 
         # The chunks of a term: those its own or a similar term is a keyword of.
         variants = {t: [t, *similar[t]] for t in stored}
@@ -150,22 +153,23 @@ class TopicSteps:
             sources=[Source(file_id=f, index_run_id=r, chunk_id=c, name=names.get(f, "")) for f, r, c in keys],
         )
 
-    def similar(self, client, term: str, query: str, user: str) -> list[str]:
+    def similar(self, client, term: str, query: str, user: str, profile: Profile) -> list[str]:
         """The stored terms that name what `term` does, other than itself: the
-        closest by vector are the candidates, the chat model picks. Nothing
-        stored close to it (or no vectors yet): no call to the model."""
+        closest by vector (as near and as many as the profile allows) are the
+        candidates, the chat model picks. Nothing stored close to it (or no
+        vectors yet): no call to the model."""
         [vector] = self.llm.embed([term])
         candidates = [t for t, _ in client.query(
             "SELECT term, min(cosineDistance(embedding, {q:Array(Float32)})) AS distance "
             "FROM term_vectors_visible(user_id = {u:String}) "
             "WHERE embed_model = {m:String} AND term != {t:String} GROUP BY term HAVING distance <= {d:Float32} "
             "ORDER BY distance LIMIT {n:UInt32}",
-            parameters={"q": vector, "m": self.llm.embed_model, "t": term, "d": SIMILAR_MAX_DISTANCE,
-                        "n": SIMILAR_CANDIDATES, "u": user},
+            parameters={"q": vector, "m": self.llm.embed_model, "t": term, "d": profile.similar_max_distance,
+                        "n": profile.similar_candidates, "u": user},
         ).result_rows]
         if not candidates:
             return []
-        prompt = SIMILAR_PROMPT.format(term=term, query=query, candidates="\n".join(candidates))
+        prompt = similar_prompt(profile, term, query, candidates)
         return similar_from(self.llm.chat_json([{"role": "user", "content": prompt}], SIMILAR_SCHEMA), candidates)
 
     def closest(self, client, question: str, keys: list[tuple[str, str, int]], n: int,
@@ -189,7 +193,7 @@ class TopicSteps:
             "WHERE (run_id, chunk_id) IN {k:Array(Tuple(String, UInt32))}",
             parameters={"k": [(s.index_run_id, s.chunk_id) for s in input.sources], "u": input.user_id},
         ).result_rows) if input.user_id else {}
-        q, calls = input.question, 0
+        q, calls, profile = input.question, 0, load(input.profile)
 
         def ask(prompt: str, schema: dict, given: str | None = None) -> dict:
             """One call; with given text (passages, notes), the prompt is the system message and the text the user's."""
@@ -204,7 +208,7 @@ class TopicSteps:
         notes: list[tuple[int, str]] = []
         for group in groups(list(enumerate(input.sources, 1))):
             passages = "\n\n".join(f"[{i}] {s.name}\n{texts.get((s.index_run_id, s.chunk_id), '')}" for i, s in group)
-            notes += notes_from(ask(MAP_PROMPT.format(question=q), MAP_SCHEMA, passages), {i for i, _ in group})
+            notes += notes_from(ask(map_prompt(profile, q), MAP_SCHEMA, passages), {i for i, _ in group})
         if not notes:
             return Generated(text="", model=self.llm.chat_model)
 

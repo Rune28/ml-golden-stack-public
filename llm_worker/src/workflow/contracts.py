@@ -87,6 +87,10 @@ class ChatInput:
     max_topic_chunks: int = 60
     # Fewer chunks found for a topic: answered as a fact (rag.topics.MIN_CHUNKS).
     min_topic_chunks: int = 6
+    # The profile of the corpus (workflow.profiles): fixed by the first
+    # message that names one, or by the route of the first message, which
+    # resolves the default; carried over by continue-as-new.
+    profile: str = ""
 
 
 @dataclass
@@ -99,6 +103,9 @@ class MessageInput:
     # checked that the chat is theirs. Every step of the answer reads only
     # this user's files; empty, a step reads nothing (fail closed).
     user_id: str = ""
+    # The profile asked for (be_service checked its form); it counts only
+    # while the chat has none.
+    profile: str = ""
 
 
 @dataclass
@@ -119,6 +126,8 @@ class Answer:
     text: str
     sources: list[Source]
     model: str
+    # The profile of the chat, for the page to show what the answer was made with.
+    profile: str = ""
 
 
 @dataclass
@@ -155,6 +164,8 @@ class RecordInput:
 @dataclass
 class RouteInput:
     question: str
+    # The profile of the chat (workflow.profiles); empty: the worker's default.
+    profile: str = ""
 
 
 @dataclass
@@ -167,6 +178,10 @@ class Route:
     # around it: what a topic is gathered and themed by. Empty from a route
     # before it existed: the message is used then.
     query: str = ""
+    # The profile the route was read with, by name and version (a hash of
+    # its file): what this answer was made with. Empty before profiles.
+    profile: str = ""
+    profile_version: str = ""
 
 
 @dataclass
@@ -177,6 +192,8 @@ class GatherInput:
     # Fewer chunks found: answered as a fact (rag.topics.MIN_CHUNKS).
     min_chunks: int = 6
     user_id: str = ""
+    # The profile of the chat (workflow.profiles); empty: the worker's default.
+    profile: str = ""
 
 
 @dataclass
@@ -212,3 +229,5 @@ class SummarizeInput:
     # story of a long message. Empty: the question.
     query: str = ""
     user_id: str = ""
+    # The profile of the chat (workflow.profiles); empty: the worker's default.
+    profile: str = ""

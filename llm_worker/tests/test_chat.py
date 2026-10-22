@@ -91,8 +91,8 @@ async def chat(env):
             ChatWorkflow.run, ChatInput(chat_id=chat_id, max_turns=max_turns), id=f"chat-{chat_id}", task_queue=queue
         )
 
-        async def send(text, run_id=None, user_id="ann"):
-            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()), user_id=user_id)
+        async def send(text, run_id=None, user_id="ann", profile=""):
+            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()), user_id=user_id, profile=profile)
             # The workflow ID without a run: after continue-as-new it reaches the new run.
             latest = env.client.get_workflow_handle(handle.id)
             return await latest.execute_update(ChatWorkflow.send_message, message)
@@ -277,3 +277,41 @@ async def test_the_user_of_a_message_reaches_every_step_that_reads(chat):
 
     for step in ("retrieve", "generate", "gather", "summarize"):
         assert [i.user_id for i in steps.of(step)] == ["ann"], step
+
+
+async def test_the_first_profile_named_sticks_to_the_chat_and_reaches_every_step_that_reads_it(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="topic", terms=["присед"], profile="fitness", profile_version="abc")
+    _, send = await start()
+
+    await send("что исследования говорят о приседе?", profile="fitness")
+    await send("а о жиме?", profile="philosophy")  # one chat, one corpus
+    answer = await send("а о становой?")
+
+    assert answer.profile == "fitness"
+    for step in ("route", "gather", "summarize"):
+        assert [i.profile for i in steps.of(step)] == ["fitness"] * 3, step
+
+
+async def test_a_chat_that_names_no_profile_keeps_the_default_its_first_route_resolved(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="fact", profile="philosophy", profile_version="abc")
+    _, send = await start()
+
+    await send("что такое трансмировая линия?")
+    await send("а кто автор?", profile="fitness")
+
+    # The first route asked for the default; from then on the chat asks for what it resolved.
+    assert [i.profile for i in steps.of("route")] == ["", "philosophy"]
+
+
+async def test_continue_as_new_carries_the_profile(chat, env):
+    steps, start = chat
+    handle, send = await start(max_turns=1)
+
+    await send("first", profile="fitness")
+    await send("second")
+
+    description = await env.client.get_workflow_handle(handle.id).describe()
+    assert description.run_id != handle.result_run_id
+    assert [i.profile for i in steps.of("route")] == ["fitness", "fitness"]

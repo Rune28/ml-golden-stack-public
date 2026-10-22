@@ -11,6 +11,7 @@ mod files;
 mod ingest;
 mod mlflow;
 mod mnist;
+mod profiles;
 mod store;
 mod temporal;
 mod visible;
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
         mlflow: mlflow::Mlflow::new(env_or("MLFLOW_URL", "http://127.0.0.1:5000")),
         ingest_lock: Default::default(),
         verifier: auth::Verifier::from_env()?,
+        profiles: profiles::Profiles::from_env()?,
         objects: files::ObjectStore::new(
             &env_or("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:8333"),
             &env_or("S3_BUCKET", "pipeline"),

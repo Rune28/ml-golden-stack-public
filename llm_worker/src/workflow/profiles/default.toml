@@ -1,0 +1,33 @@
+# Documents of no particular kind: the profile of a corpus that has none of
+# its own. Its examples name no author or field, so they mislead no one; a
+# corpus with questions of its own gets a profile of its own, measured on
+# them (llm_worker/CLAUDE.md, Profiles). Not measured on the model yet.
+#
+# The texts go into the prompts exactly as written here, line breaks and
+# indents included (rag.profiles says why).
+
+[route.interpret]
+text = """the user describes their own situation, experience or idea and asks what it means or how to
+  understand it through the documents ("вот что со мной было: … как это понять?", "то есть в моём случае это значит, что…?")."""
+
+[route.topic]
+text = """the user asks what the documents or an author say about a subject, gathered from many passages
+  ("что в документах говорится о времени?", "как автор понимает свободу?")."""
+
+[route.fact]
+text = """a definition, a name, a date, a number, a detail ("что означает этот термин?", "кто автор документа?")."""
+
+[route]
+terms = """the subject asked about first (время,
+  свобода), then a name or a word that narrows it. Never only a name: "как автор понимает свободу?"
+  gives свободу, автор."""
+
+[similar]
+max_distance = 0.3
+candidates = 15
+same = "for «время»: длительность, течение времени"
+related = "for «время»: часы, пространство"
+
+[map]
+attribution = """Passages may quote other authors or report other studies: say whose words or whose finding a
+point is, and never write the "I" of a quote as your own."""

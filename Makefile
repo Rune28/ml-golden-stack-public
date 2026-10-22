@@ -254,13 +254,15 @@ reindex-all:
 	done
 
 # Without CHAT a new chat starts and its id is printed; with it the question
-# goes on in that chat, so the answer can build on the earlier ones.
+# goes on in that chat, so the answer can build on the earlier ones. P names
+# the profile of a new chat (llm_worker/src/workflow/profiles); without it
+# the worker's default.
 chat:
-	@test -n "$(Q)" || { echo 'usage: make chat Q="question" [CHAT=<chat_id>]'; exit 1; }
+	@test -n "$(Q)" || { echo 'usage: make chat Q="question" [CHAT=<chat_id>] [P=<profile>]'; exit 1; }
 	$(need-token)
 	@chat="$(CHAT)"; \
 	if [ -z "$$chat" ]; then chat=$$(curl -sS $(AUTH) -X POST http://127.0.0.1:9001/api/chats | jq -r .chat_id); echo "CHAT=$$chat"; fi; \
-	jq -n --arg text "$(Q)" '{text: $$text}' \
+	jq -n --arg text "$(Q)" --arg profile "$(P)" '{text: $$text, profile: $$profile}' \
 	  | curl -sS $(AUTH) -H 'content-type: application/json' --data-binary @- http://127.0.0.1:9001/api/chats/$$chat/messages \
 	  | jq -r 'if .error then "error: \(.error)" else "\(.text)\n\nturn \(.turn), sources: \([.sources[] | "\(.name)#\(.chunk_id)"] | join(", "))" end'
 

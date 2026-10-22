@@ -1,0 +1,49 @@
+# A book of lectures on philosophy and literature (Mamardashvili on Proust):
+# one author's voice that quotes others, concepts developed across the whole
+# text, and readers who bring their own dreams and thoughts to it.
+#
+# The texts go into the prompts exactly as written here, line breaks and
+# indents included (rag.profiles says why). An edit is a new version of the
+# profile: measure the route on the control questions before it is released
+# (llm_worker/CLAUDE.md, Profiles).
+
+# Measured on qwen3:4b: five messages about the user's dreams and seven
+# control questions, each kind right 5 times of 5 (2026-10-21), 57 of 60
+# with "что такое пирожное мадлен у Пруста?" on the edge between a fact and
+# a topic (2026-10-22). Told "fact otherwise, and any story of the user's"
+# instead of a kind of its own, the model sent every dream to a topic, 20
+# of 20.
+[route.interpret]
+text = """the user tells their own story, dream, experience or thought and asks what it means or how to
+  understand it ("как бы ты описал этот сон? мне снилось, что…", "то есть во сне отыгрывается страх?")."""
+
+[route.topic]
+text = """the user asks what the documents or an author say about a subject, gathered from many passages
+  ("что Пруст говорит о смерти?", "что автор имел в виду под топологией пути?", "как Мамардашвили понимает любовь?")."""
+
+[route.fact]
+text = """a definition, a name, a date, a detail ("что такое трансмировая линия?", "кто автор книги?")."""
+
+# Without "never only a name", the terms of "что Пруст говорит о смерти?"
+# were Пруст alone: a theme of the whole book, too broad to gather.
+[route]
+terms = """the subject asked about first (смерть, любовь,
+  сон), then a name or a word that narrows it (Пруст). Never only a name: "что Пруст говорит о смерти?"
+  gives смерти, Пруст."""
+
+# Cosine distance of bge-m3. The model let through what was close enough to
+# be offered: at 0.4, сон → соната (0.36), просыпание (0.33), бодрствование
+# (0.38) and транссибирская магистраль → трансмировая линия (0.34). Synonyms
+# measured within 0.3: сон → сновидение 0.22, мечтание 0.28; личность →
+# индивидуальность 0.23; изменение → преобразование 0.25; страх → ужас 0.28.
+# Lost: изменение → превращение 0.32.
+[similar]
+max_distance = 0.3
+candidates = 15
+same = "for «сон»: сновидение, тяжёлый сон"
+related = "for «сон»: пробуждение, ночь"
+
+# The lecturer quotes Proust at length, often in the first person.
+[map]
+attribution = """Passages often quote other authors: say whose words a point is ("Proust writes that..."), and never
+write the "I" of a quote as your own."""

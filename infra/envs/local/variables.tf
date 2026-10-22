@@ -61,3 +61,15 @@ variable "llm_embed_model" {
   type        = string
   default     = "bge-m3"
 }
+
+variable "llm_profiles" {
+  description = "Profiles a chat may name: files in llm_worker/src/workflow/profiles, offered on the chat page."
+  type        = list(string)
+  default     = ["philosophy", "default"]
+}
+
+variable "llm_default_profile" {
+  description = "Profile of a chat that names none, one of llm_profiles: the corpus uploaded today is a book of lectures on philosophy."
+  type        = string
+  default     = "philosophy"
+}
