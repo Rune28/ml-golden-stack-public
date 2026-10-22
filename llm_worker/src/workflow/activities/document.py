@@ -63,7 +63,7 @@ class Reader:
             [{"role": "system", "content": METADATA_PROMPT}, {"role": "user", "content": metadata_request(name, text)}],
             METADATA_SCHEMA,
         )
-        meta = parse_metadata(answer)
+        meta = parse_metadata(answer, name)
         doc = document_id(find_doi(text), find_isbn(text), input.file_id)
         # The abstract's vector: documents are found by their topic even
         # before the concept graph is built over them.

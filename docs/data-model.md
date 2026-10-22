@@ -50,6 +50,9 @@ erDiagram
     pg_users ||--o{ file_owners : "user_id (A2)"
     pg_users ||--o{ chat_owners : "user_id (A2)"
     files ||--o{ file_owners : "file_id"
+    file_owners ||--o| document_edits : "user_id + file_id"
+    file_owners ||--o{ collection_files : "user_id + file_id"
+    collections ||--o{ collection_files : "user_id + collection_id"
     chat_owners ||--|{ chat_messages : "chat_id"
 
     files ||--o{ doc_chunks : "file_id"
@@ -144,6 +147,28 @@ erDiagram
         Float32 share
         Float32 zipf
     }
+    document_edits {
+        String user_id PK "the user's own correction"
+        String file_id PK
+        Array_String corrected "title, authors, kind, year"
+        String title
+        Array_String authors
+        String kind
+        UInt16 year "nullable"
+        Bool confirmed
+    }
+    collections {
+        String user_id PK "a personal group of sources"
+        String collection_id PK
+        String name
+        Bool deleted
+    }
+    collection_files {
+        String user_id PK
+        String collection_id PK
+        String file_id PK
+        Bool removed
+    }
     chat_messages {
         String run_id PK "answer run"
         String chat_id
@@ -209,6 +234,9 @@ flowchart LR
 
     V --> R["readers: be_service visible.rs,<br/>retrieve, gather, summarize, generate"]
 ```
+
+- **`documents_visible(user_id)`** is one row per file of the user: their correction (`document_edits`) over what read_document found, every field with its source (`edit` or `text`), and the file's groups. **`collections_visible(user_id)`** is their groups that are not deleted, with their files. A chat's scope is resolved to files through both (docs/search-scope-plan.md).
+
 
 - **Writers write tables only**, each row under the `run_id` of its run, the marker in `runs` last.
 - **`*_current`** leaves out runs halfway, runs replaced by a newer one, and files deleted since (rule 11).

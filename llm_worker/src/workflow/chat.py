@@ -6,7 +6,11 @@ or the user's own story to interpret, is answered from the chunks closest
 to the message as written (retrieve, generate): the story is what finds
 the passages about it. A message about a topic is answered from every chunk
 the topic is a keyword of (gather, summarize: map-reduce), gathered and
-themed by the short query route reads from it. What counts as which kind,
+themed by the short query route reads from it. A message that lists
+aspects (жизнь, смерть, любовь), or compares two or more of the user's
+authors, groups or kinds, is answered in sections: each aspect in the
+documents of each side gathered apart, with a share of the chunks, and a
+paragraph per aspect. What counts as which kind,
 and which words are synonyms, is the chat's profile (workflow.profiles): the
 workflow carries its name. The first message starts the workflow in the same call
 (UpdateWithStart). Between messages the workflow only waits, and a waiting
@@ -28,15 +32,19 @@ from .contracts import (
     Answer,
     ChatInput,
     ChatMessage,
-    Gathered,
     GatherInput,
-    Generated,
+    Gathered,
     GenerateInput,
+    Generated,
     MessageInput,
     RecordInput,
     RetrieveInput,
     Route,
     RouteInput,
+    Scope,
+    ScopeInput,
+    Scoped,
+    Section,
     Source,
     SummarizeInput,
 )
@@ -44,6 +52,7 @@ from .contracts import (
 # Activities by name: the workflow sandbox never imports ClickHouse or the LLM adapter.
 RETRIEVE, GENERATE, RECORD = "retrieve", "generate", "record"
 ROUTE, GATHER, SUMMARIZE = "route", "gather", "summarize"
+RESOLVE_SCOPE = "resolve_scope"
 RETRY = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=2))
 
 # Messages (user and assistant) the model sees besides the question: 3 turns.
@@ -62,6 +71,7 @@ class ChatWorkflow:
         self.max_topic_chunks = input.max_topic_chunks
         self.min_topic_chunks = input.min_topic_chunks
         self.profile = input.profile
+        self.scope = input.scope
         self.answered = 0  # in this run
         # Updates run concurrently as soon as they arrive; the lock queues them.
         self.lock = asyncio.Lock()
@@ -74,7 +84,7 @@ class ChatWorkflow:
         workflow.continue_as_new(
             ChatInput(chat_id=self.chat_id, history=self.history, turns=self.turns, max_turns=self.max_turns,
                       max_topic_chunks=self.max_topic_chunks, min_topic_chunks=self.min_topic_chunks,
-                      profile=self.profile)
+                      profile=self.profile, scope=self.scope)
         )
 
     @workflow.update(name="send_message")
@@ -88,12 +98,21 @@ class ChatWorkflow:
             # A chat that named none keeps the default its first route resolved,
             # not whatever the default is later.
             self.profile = self.profile or route.profile
-            # A fact and a story to interpret (route.kind interpret) take the same path.
-            topic = await self.topic(message, route) if route.kind == "topic" else None
-            if topic:
-                generated, sources = topic
+            # The first scope named sticks too; the message's own words may
+            # narrow it for this answer (route.filters), never widen it.
+            if self.scope.empty() and not message.scope.empty():
+                self.scope = message.scope
+            scoped = await self.resolve_scope(message, route.filters)
+            file_ids = scoped.file_ids if scoped else []
+            if scoped and not file_ids:
+                generated, sources = Generated(text=nothing_in_scope(message.text, scoped.label), model=""), []
             else:
-                generated, sources = await self.fact(message)
+                # A fact and a story to interpret (route.kind interpret) take the same path.
+                topic = await self.topic(message, route, file_ids) if route.kind in ("topic", "compare") else None
+                if topic:
+                    generated, sources = topic
+                else:
+                    generated, sources = await self.fact(message, file_ids)
             turn = self.turns + 1
             await workflow.execute_activity(
                 RECORD,
@@ -109,21 +128,32 @@ class ChatWorkflow:
             self.turns = turn
             self.answered += 1
             return Answer(run_id=message.run_id, turn=turn, text=generated.text, sources=sources,
-                          model=generated.model, profile=self.profile)
+                          model=generated.model, profile=self.profile, scope_label=scoped.label if scoped else "")
 
     async def route(self, message: MessageInput) -> Route:
         return await workflow.execute_activity(
-            ROUTE, RouteInput(question=message.text, profile=self.profile), result_type=Route,
+            ROUTE, RouteInput(question=message.text, profile=self.profile, user_id=message.user_id), result_type=Route,
             start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
         )
 
-    async def fact(self, message: MessageInput) -> tuple[Generated, list[Source]]:
+    async def resolve_scope(self, message: MessageInput, narrow: Scope) -> Scoped | None:
+        """The user's files the chat's scope and the message's own narrowing
+        come to; None when neither names one (every visible file). Scopes
+        came after the first release: behind a patch (principle 6)."""
+        if (self.scope.empty() and narrow.empty()) or not workflow.patched("scope"):
+            return None
+        return await workflow.execute_activity(
+            RESOLVE_SCOPE, ScopeInput(user_id=message.user_id, scope=self.scope, narrow=narrow), result_type=Scoped,
+            start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
+        )
+
+    async def fact(self, message: MessageInput, file_ids: list[str]) -> tuple[Generated, list[Source]]:
         """From the chunks closest to the message. Not to its short query: the
         query of a dream retold was "как бы ты описал этот сон?", and only the
         story found the passages on dreams of cities and houses."""
         sources = await workflow.execute_activity(
             RETRIEVE,
-            RetrieveInput(question=message.text, user_id=message.user_id),
+            RetrieveInput(question=message.text, user_id=message.user_id, file_ids=file_ids),
             result_type=list[Source],
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RETRY,
@@ -138,15 +168,20 @@ class ChatWorkflow:
         )
         return generated, sources
 
-    async def topic(self, message: MessageInput, route: Route) -> tuple[Generated, list[Source]] | None:
+    async def topic(self, message: MessageInput, route: Route, file_ids: list[str]) -> tuple[Generated, list[Source]] | None:
         """From every chunk the topic is a keyword of; None when its words
         name nothing stored. Gathered and themed by the short query (the
         message from a route before the query existed), the notes taken on
         what the message asks."""
         query = route.query or message.text
+        # Sections came after topics: chats whose route never gave aspects or
+        # sides replay as before (principle 6).
+        if (route.sides or route.aspects) and workflow.patched("sections"):
+            return await self.sections(message, route, file_ids, query)
         gathered = await workflow.execute_activity(
             GATHER, GatherInput(question=query, terms=route.terms, max_chunks=self.max_topic_chunks,
-                                min_chunks=self.min_topic_chunks, user_id=message.user_id, profile=self.profile),
+                                min_chunks=self.min_topic_chunks, user_id=message.user_id, profile=self.profile,
+                                file_ids=file_ids),
             result_type=Gathered,
             start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
         )
@@ -167,6 +202,57 @@ class ChatWorkflow:
         # The chunks of the topic say nothing about the question: as a fact.
         return (generated, gathered.sources) if generated.text else None
 
+    async def sections(self, message: MessageInput, route: Route, file_ids: list[str],
+                       query: str) -> tuple[Generated, list[Source]] | None:
+        """Every aspect in the documents of every side, gathered apart with an
+        equal share of max_topic_chunks, then summarized a section each. A side
+        with none of the user's files in scope is left out; None when nothing
+        is gathered (answered as a fact)."""
+        sides: list[tuple[str, list[str]]] = []
+        for side in route.sides:
+            scoped = await workflow.execute_activity(
+                RESOLVE_SCOPE, ScopeInput(user_id=message.user_id, scope=self.scope, narrow=side.scope),
+                result_type=Scoped, start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
+            )
+            if scoped.file_ids:
+                sides.append((side.label, scoped.file_ids))
+        if route.sides and not sides:
+            return None
+        sides = sides or [("", file_ids)]
+        aspects = route.aspects or [""]
+        share = max(self.min_topic_chunks, self.max_topic_chunks // (len(sides) * len(aspects)))
+        sources: list[Source] = []
+        numbers: dict[tuple[str, str, int], int] = {}
+        sections: list[Section] = []
+        for label, files in sides:
+            for aspect in aspects:
+                gathered = await workflow.execute_activity(
+                    GATHER, GatherInput(question=aspect or query, terms=[aspect] if aspect else route.terms,
+                                        max_chunks=share, min_chunks=self.min_topic_chunks,
+                                        user_id=message.user_id, profile=self.profile, file_ids=files, fill=True),
+                    result_type=Gathered, start_to_close_timeout=timedelta(seconds=60), retry_policy=RETRY,
+                )
+                passages = []
+                for source in gathered.sources:
+                    key = (source.file_id, source.index_run_id, source.chunk_id)
+                    if key not in numbers:
+                        sources.append(source)
+                        numbers[key] = len(sources)
+                    passages.append(numbers[key])
+                sections.append(Section(aspect=aspect, side=label, passages=passages))
+        if not sources:
+            return None
+        generated = await workflow.execute_activity(
+            SUMMARIZE,
+            SummarizeInput(question=message.text, sources=sources, query=query, user_id=message.user_id,
+                           profile=self.profile, sections=sections),
+            result_type=Generated,
+            # A call per group of chunks and one per aspect, as for a topic.
+            start_to_close_timeout=timedelta(minutes=15), heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RETRY,
+        )
+        return (generated, sources) if generated.text else None
+
     @send_message.validator
     def validate_message(self, message: MessageInput) -> None:
         # A rejected Update leaves no trace in the workflow history.
@@ -176,6 +262,16 @@ class ChatWorkflow:
             raise ValueError(f"the message is longer than {MAX_MESSAGE_CHARS} characters")
         if not message.run_id:
             raise ValueError("run_id is required")
+
+
+def nothing_in_scope(question: str, scope: str) -> str:
+    """The answer when a scope matches none of the user's files: said, never
+    answered from every file instead."""
+    if any("а" <= c <= "я" for c in question.lower()):
+        return (f"В выбранной области нет ни одного документа ({scope}). "
+                "Проверь группы и данные документов или начни новый чат с другой областью.")
+    return (f"No document is in the chosen scope ({scope}). "
+            "Check the groups and the documents' data, or start a new chat with another scope.")
 
 
 def too_broad(question: str, broad: list[tuple[str, str, int]]) -> str:

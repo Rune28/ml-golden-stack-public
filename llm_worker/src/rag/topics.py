@@ -5,7 +5,10 @@ become the terms the keywords of the chunks are stored by.
 A question about a fact ("what is a transworld line?") is answered from the
 few chunks closest to it. A question about a topic ("what does the book say
 about death?") needs every chunk the topic is a keyword of, summarized a
-group at a time and then together (map-reduce).
+group at a time and then together (map-reduce). A question that lists
+aspects ("о жизни, смерти и любви") or compares authors is answered in
+sections: the notes of each aspect make its paragraph, marked with whose
+documents they come from.
 
 The prompts here are templates: what depends on the corpus (what counts as
 which kind of message, examples of synonyms, whose words a passage gives)
@@ -18,7 +21,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from rag.mentions import candidates
+from rag.mentions import candidates, latin, word_lemmas
 
 if TYPE_CHECKING:  # rag.profiles imports KINDS from here
     from rag.profiles import Profile
@@ -46,21 +49,32 @@ GROUP = 6
 # never saw the question ("Математическое описание сна"); through the closest
 # chunks, an answer about that dream.
 KINDS = ("fact", "topic", "interpret")
+# A kind route never asks the model about: a message that names two or more
+# of the user's authors, groups or kinds (where_in) compares them, whatever
+# the model read. The documents of each side are gathered apart, with a share
+# of the chunks each: gathered together, 40 chunks of 43 came from the book
+# and the notes of Саша were three (chat 01a16252, 2026-10-22).
+COMPARE = "compare"
+# Aspects a message lists that an answer covers one by one, at most.
+MAX_ASPECTS = 4
 
 # The model writes the fields in this order. The kind first, off the whole
 # message: written after the query, it was read off a short question and a
-# dream went the other way 3 times of 5. Then the query, then the terms off
-# the query, not off the story. Without "in Russian", the query came in
+# dream went the other way 3 times of 5. The aspects next, off the whole
+# message too: written after the query, which keeps only "чем заметки Саши
+# отличаются", they were lost or split with the terms 4 times of 6. Then the
+# query, then the terms off the query, not off the story. Without "in Russian", the query came in
 # English 4 times of 6. What counts as which kind, with examples, is the
 # profile's: the measurements of its examples are in its file.
 ROUTE_SCHEMA = {
     "type": "object",
     "properties": {
         "kind": {"type": "string", "enum": list(KINDS)},
+        "aspects": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ASPECTS},
         "query": {"type": "string"},
         "terms": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
     },
-    "required": ["kind", "query", "terms"],
+    "required": ["kind", "aspects", "query", "terms"],
 }
 
 # The kinds are listed with the one the model confused most first.
@@ -69,6 +83,8 @@ ROUTE_TEMPLATE = """You decide how to answer a message about the user's document
   interpret: {interpret}
   topic: {topic}
   fact: {fact}
+- aspects: when the message lists several subjects to cover one by one ("о A, B и C"), each of them, as
+  written in the message; an empty list when it asks about one subject. No "and other questions".
 - query: what the message asks of the documents, as one short question in the language of the message
   (a message in Russian gets a query in Russian), at most 20 words: the subject and what is asked about it,
   without the story or the examples around it.
@@ -178,6 +194,16 @@ passages. Keep whose words a point is as the notes give it. Use only the notes.
 
 Theme: {theme}"""
 
+# A paragraph of a comparison: the notes of every side on one theme, each
+# marked with whose documents it comes from.
+COMPARE_PROMPT = """Write one paragraph on the theme below from the notes the user gives, taken on numbered
+passages of the documents of: {sides}. Each note is marked with whose documents it comes from, as (Name).
+Say what each of them says on the theme, then where they agree and where they differ, in 3 to 6 sentences,
+in the language of the notes, citing passages as [3]. When one of them has no notes on the theme, say that
+nothing on it was found in their documents. Never give the words of one of them to another. Use only the notes.
+
+Theme: {theme}"""
+
 # The second level of the reduce: notes too many for one call are condensed a
 # batch at a time, keeping their passage numbers, until they fit.
 CONDENSE_PROMPT = """The user gives notes taken on numbered passages of the user's documents.
@@ -193,6 +219,75 @@ def lemmas(term: str) -> str | None:
     линий" → трансмировая линия (the longest candidate: the whole phrase)."""
     found = candidates(term)
     return max(found, key=lambda t: (len(t.split()), len(t))) if found else None
+
+
+# Where a message itself asks to look ("в моих блогах", "у Мамардашвили"),
+# among the user's own groups, authors and kinds (docs/search-scope-plan.md,
+# M4). Matched on the words, not asked of the model: given the lists,
+# qwen3:4b returned every value of them for almost any message, right 3
+# times of 45 (2026-10-22).
+def where_in(message: str, groups: dict[str, str], authors: list[str], kind_words: dict[str, str],
+             kinds: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """(group ids, authors, kinds) a message names: a group whose every word
+    is a word of the message, an author whose surname is (Мамардашвили and
+    Merab Mamardashvili are one), a kind whose word of the profile is and
+    which the user has. groups: name → id."""
+    words = word_lemmas(message)
+    in_latin = {latin(w) for w in words}
+    picked_groups = [gid for name, gid in sorted(groups.items()) if word_lemmas(name) and word_lemmas(name) <= words]
+    picked_authors = [a for a in authors if _surname(a) and latin(_surname(a)) in in_latin]
+    picked_kinds = sorted({kind for word, kind in kind_words.items() if word in words and kind in kinds})
+    return picked_groups, picked_authors, picked_kinds
+
+
+def _surname(name: str) -> str:
+    """"Smith, J. A." → smith; "Merab Mamardashvili" → mamardashvili."""
+    part = name.split(",")[0] if "," in name else name
+    words = [w.strip(".").lower() for w in part.split() if len(w.strip(".")) > 1]
+    return (words[0] if "," in name else words[-1]) if words else ""
+
+
+_OTHER = {"другой", "прочий", "остальной", "other", "others"}
+
+
+def aspects_from(answer: dict, message: str, document_words: frozenset[str]) -> list[str]:
+    """The aspects of a route answer, checked: words of the message (for a
+    dream the model once gave "мечта, мажорность"), once each by their stored
+    form, none that only names documents, at most MAX_ASPECTS; fewer than two
+    is one subject, so none."""
+    words = word_lemmas(message)
+    out, seen = [], set()
+    for item in answer.get("aspects") or []:
+        if not isinstance(item, str) or not item.strip() or names_documents(item, document_words):
+            continue
+        if not word_lemmas(item) <= words:
+            continue
+        # Told not to, the model still gave "другие философские вопросы" once in 5.
+        if word_lemmas(item) & _OTHER:
+            continue
+        key = lemmas(item) or item.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(item.strip())
+    return out[:MAX_ASPECTS] if len(out) >= 2 else []
+
+
+def names_authors(term: str, authors: list[str]) -> bool:
+    """Whether a term only names authors the message is narrowed to
+    ("Саши", "Мамардашвили"): every word of it is the surname of one. They
+    are where to look, already in the filters; as a term, an author's name
+    gathers the passages that mention them, not what they think."""
+    surnames = {latin(_surname(a)) for a in authors if _surname(a)}
+    words = {latin(w) for w in word_lemmas(term)}
+    return bool(words) and words <= surnames
+
+
+def names_documents(term: str, document_words: frozenset[str]) -> bool:
+    """Whether a term only names documents ("файлы блог", "книги"): every
+    noun of it is a document word of the profile. "путь автора" is not:
+    путь is what is asked about."""
+    nouns = [c for c in candidates(term) if " " not in c]
+    return bool(nouns) and all(n in document_words for n in nouns)
 
 
 def similar_from(answer: dict, candidates: list[str]) -> list[str]:
@@ -219,11 +314,16 @@ def notes_from(answer: dict, passages: set[int]) -> list[tuple[int, str]]:
     return out
 
 
-def render_notes(notes: list[tuple[int, str]], limit: int | None = MAX_NOTES_CHARS) -> str:
-    """Notes as the reduce step reads them, in the order of the passages, cut at the limit."""
+def render_notes(notes: list[tuple[int, str]], limit: int | None = MAX_NOTES_CHARS,
+                 who: dict[int, str] | None = None) -> str:
+    """Notes as the reduce step reads them, in the order of the passages, cut
+    at the limit, each with whose documents its passage is from ("[19]
+    (Мамардашвили) ..."): without it, a note on a lecture about Proust became
+    "Саша утверждает..." in a comparison of the two (chat 01a16252)."""
     lines, size = [], 0
     for passage, note in sorted(notes):
-        line = f"[{passage}] {note}"
+        mark = (who or {}).get(passage)
+        line = f"[{passage}] ({mark}) {note}" if mark else f"[{passage}] {note}"
         if limit is not None and size + len(line) > limit:
             break
         lines.append(line)
@@ -268,6 +368,11 @@ def cites(paragraph: str, passages: list[int]) -> bool:
     return bool(cited & set(passages))
 
 
-def assemble(paragraphs: list[tuple[str, str]]) -> str:
-    """The answer: a heading and a paragraph per theme."""
-    return "\n\n".join(f"**{theme}**\n{paragraph}" for theme, paragraph in paragraphs)
+def assemble(paragraphs: list[tuple[str, str]], missing: list[str] = (), russian: bool = True) -> str:
+    """The answer: a heading and a paragraph per theme, then the aspects asked
+    about that no passage said anything on, so they are not silently left out."""
+    parts = [f"**{theme}**\n{paragraph}" for theme, paragraph in paragraphs]
+    if missing:
+        listed = ", ".join(missing)
+        parts.append(f"В документах не нашлось ничего о: {listed}." if russian else f"Nothing was found on: {listed}.")
+    return "\n\n".join(parts)

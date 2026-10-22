@@ -150,19 +150,89 @@ pub struct FileRow {
     pub embed_model: String,
 }
 
-/// A document with the files it came in. Its fields are those of its latest
-/// document run, when it came in several files.
+/// One of the user's files as a document (documents_visible): the user's
+/// correction over what read_document found, every field with its source,
+/// `edit` or `text`. `read` is false until the document run of the file
+/// commits; its fields are empty then.
 #[derive(Serialize, Deserialize, Row, Debug)]
 pub struct DocumentRow {
+    pub file_id: String,
+    pub name: String,
     pub document_id: String,
+    pub read: bool,
     pub title: String,
-    pub year: Option<u16>,
-    pub kind: String,
-    pub keywords: Vec<String>,
+    pub title_source: String,
     pub authors: Vec<String>,
-    pub files: Vec<String>,
-    /// The top themes of the file the fields come from, by rank.
+    pub authors_source: String,
+    pub kind: String,
+    pub kind_source: String,
+    pub year: Option<u16>,
+    pub year_source: String,
+    pub confirmed: bool,
+    pub keywords: Vec<String>,
+    pub collection_ids: Vec<String>,
+    /// The top themes of the file, by rank.
     pub themes: Vec<String>,
+    pub uploaded_at: u32,
+}
+
+/// A user's correction of the metadata of one of their files, as stored
+/// (document_edits): `corrected` names the fields the user set, the others
+/// are left to read_document.
+#[derive(Serialize, Deserialize, Row, Debug, Clone, Default, PartialEq)]
+pub struct DocumentEdit {
+    pub corrected: Vec<String>,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub kind: String,
+    pub year: Option<u16>,
+    pub confirmed: bool,
+}
+
+/// What a scope of a chat can be made of, of one of the user's documents.
+#[derive(Deserialize, Row, Debug)]
+pub struct DocumentFacet {
+    pub authors: Vec<String>,
+    pub kind: String,
+    pub year: Option<u16>,
+}
+
+/// One of the user's groups of sources, with their files in it.
+#[derive(Serialize, Deserialize, Row, Debug)]
+pub struct CollectionRow {
+    pub collection_id: String,
+    pub name: String,
+    pub file_ids: Vec<String>,
+}
+
+/// `edited_at` is left to its DEFAULT now64(): the latest save wins.
+#[derive(Serialize, Row)]
+struct DocumentEditInsert<'a> {
+    user_id: &'a str,
+    file_id: &'a str,
+    corrected: &'a [String],
+    title: &'a str,
+    authors: &'a [String],
+    kind: &'a str,
+    year: Option<u16>,
+    confirmed: bool,
+}
+
+/// `changed_at` is left to its DEFAULT now64(): the latest change wins.
+#[derive(Serialize, Row)]
+struct CollectionInsert<'a> {
+    user_id: &'a str,
+    collection_id: &'a str,
+    name: &'a str,
+    deleted: bool,
+}
+
+#[derive(Serialize, Row)]
+struct CollectionFileInsert<'a> {
+    user_id: &'a str,
+    collection_id: &'a str,
+    file_id: &'a str,
+    removed: bool,
 }
 
 /// `added_at` is left to its DEFAULT now64().
@@ -302,13 +372,75 @@ impl ClickHouse {
         Ok(())
     }
 
+    /// The user's link to a file, then what the user made of it: their
+    /// correction of its document and its places in their groups. The link
+    /// goes first: the views read nothing of a file the user has no link to.
     pub async fn remove_owner(&self, user: &str, file_id: &str) -> Result<()> {
-        self.client
-            .query("DELETE FROM file_owners WHERE user_id = ? AND file_id = ?")
+        for table in ["file_owners", "document_edits", "collection_files"] {
+            self.client
+                .query(&format!("DELETE FROM {table} WHERE user_id = ? AND file_id = ?"))
+                .bind(user)
+                .bind(file_id)
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The user's correction of a file's document, empty when they made
+    /// none. A writer reading its own rows (db/CLAUDE.md): the latest save.
+    pub async fn document_edit(&self, user: &str, file_id: &str) -> Result<DocumentEdit> {
+        Ok(self
+            .client
+            .query(
+                "SELECT corrected, title, authors, kind, year, confirmed FROM document_edits FINAL \
+                 WHERE user_id = ? AND file_id = ?",
+            )
             .bind(user)
             .bind(file_id)
-            .execute()
+            .fetch_optional()
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// The whole correction again: a retry of the same save writes the same row.
+    pub async fn put_document_edit(&self, user: &str, file_id: &str, edit: &DocumentEdit) -> Result<()> {
+        let mut insert = self.client.insert::<DocumentEditInsert>("document_edits").await?;
+        insert
+            .write(&DocumentEditInsert {
+                user_id: user,
+                file_id,
+                corrected: &edit.corrected,
+                title: &edit.title,
+                authors: &edit.authors,
+                kind: &edit.kind,
+                year: edit.year,
+                confirmed: edit.confirmed,
+            })
             .await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    /// A group made, renamed or deleted: its whole row again.
+    pub async fn put_collection(&self, user: &str, collection_id: &str, name: &str, deleted: bool) -> Result<()> {
+        let mut insert = self.client.insert::<CollectionInsert>("collections").await?;
+        insert.write(&CollectionInsert { user_id: user, collection_id, name, deleted }).await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    /// A file put in a group or taken out of it.
+    pub async fn put_collection_file(
+        &self,
+        user: &str,
+        collection_id: &str,
+        file_id: &str,
+        removed: bool,
+    ) -> Result<()> {
+        let mut insert = self.client.insert::<CollectionFileInsert>("collection_files").await?;
+        insert.write(&CollectionFileInsert { user_id: user, collection_id, file_id, removed }).await?;
+        insert.end().await?;
         Ok(())
     }
 

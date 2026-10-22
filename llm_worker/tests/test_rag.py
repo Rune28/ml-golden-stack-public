@@ -2,7 +2,16 @@ import pytest
 
 from pdf_fixture import make_pdf
 from rag.chunking import chunk, distinct, read_text
-from rag.documents import HEAD, author_id, document_id, find_doi, find_isbn, metadata_request, parse_metadata
+from rag.documents import (
+    HEAD,
+    author_id,
+    document_id,
+    find_doi,
+    find_isbn,
+    looks_like_a_person,
+    metadata_request,
+    parse_metadata,
+)
 
 
 def test_read_text_drops_the_bom_and_windows_newlines():
@@ -86,7 +95,8 @@ def test_an_author_is_one_key_however_the_name_is_written():
 def test_the_model_answer_is_checked():
     meta = parse_metadata({
         "title": " Squat depth ",
-        "authors": [{"name": "John A. Smith"}, {"name": "Smith, J. A."}, {"name": ""}, "broken"],
+        "people": [{"name": "John A. Smith", "role": "author"}, {"name": "Smith, J. A.", "role": "author"},
+                   {"name": "", "role": "author"}, {"name": "Jane Doe", "role": "editor"}, "broken"],
         "year": 3021,
         "kind": "poem",
         "abstract": None,
@@ -106,3 +116,50 @@ def test_the_model_gets_the_file_name_and_the_length_of_the_whole_text():
     assert "File name: Merab_Mamardashvili_-_Topologia.txt" in request
     assert f"Length of the whole text: {len(text):,} characters" in request
     assert request.endswith(text[:HEAD])
+
+
+BOOK = "Merab_Mamardashvili_-_Psikhologicheskaya_topologia_puti_single.txt"
+
+
+def test_whom_a_book_is_about_or_who_edited_it_is_not_its_author():
+    # The title page of the lectures names Proust's novel and the editors;
+    # the lecturer is only in the file name. Asked for authors, the model
+    # gave "М. Пруст" 5 times of 5.
+    meta = parse_metadata({
+        "people": [{"name": "М.Пруст", "role": "subject"}, {"name": "О. Мандельштам", "role": "quoted"},
+                   {"name": "Ю. П. Сенокосов", "role": "editor"}, {"name": "И. К. Мамардашвили", "role": "editor"}],
+        "file_name_author": "Merab_Mamardashvili",
+    }, BOOK)
+
+    assert [a.name for a in meta.authors] == ["Merab Mamardashvili"]
+
+
+def test_what_the_model_writes_for_no_author_is_no_author():
+    # Measured on the blogs, which name no author: "автор", "Меня", the file name.
+    for people, from_name, file in [
+        ([{"name": "автор", "role": "author"}], "", "блог.txt"),
+        ([{"name": "Меня", "role": "author"}], "", "блог 4.txt"),
+        ([], "блог 5.txt", "блог 5.txt"),
+        ([], "блог 3", "блог 3.txt"),
+        ([], "Иван Петров", "блог.txt"),  # not in the file name
+    ]:
+        assert parse_metadata({"people": people, "file_name_author": from_name}, file).authors == [], (people, from_name)
+
+
+def test_a_person_is_initials_a_latin_name_or_a_name_pymorphy_knows():
+    assert looks_like_a_person("Ю. П. Сенокосов") and looks_like_a_person("Merab Mamardashvili")
+    assert looks_like_a_person("Мамардашвили") and looks_like_a_person("Келли")
+    assert not looks_like_a_person("автор") and not looks_like_a_person("Меня") and not looks_like_a_person("блог")
+    assert not looks_like_a_person("Squats", "Squats.pdf")
+
+
+def test_a_file_named_after_a_person_not_among_the_page_authors_is_theirs():
+    # With roles the model still marked Proust the author 4 times of 5.
+    book = parse_metadata({"people": [{"name": "М.Пруст", "role": "author"}],
+                           "file_name_author": "Merab Mamardashvili"}, BOOK)
+    paper = parse_metadata({"people": [{"name": "John A. Smith", "role": "author"},
+                                       {"name": "Maria Ivanova", "role": "author"}],
+                            "file_name_author": "Smith"}, "Smith2021_squat.pdf")
+
+    assert [a.name for a in book.authors] == ["Merab Mamardashvili"]
+    assert [a.name for a in paper.authors] == ["John A. Smith", "Maria Ivanova"]

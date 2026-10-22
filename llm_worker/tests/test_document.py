@@ -15,7 +15,8 @@ SCHEDULED = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 FILE = {"name": "squats.pdf", "object_key": "files/abc"}
 ANSWER = {
     "title": "Squat depth and knee load",
-    "authors": [{"name": "John A. Smith"}, {"name": "Maria Ivanova"}],
+    "people": [{"name": "John A. Smith", "role": "author"}, {"name": "Maria Ivanova", "role": "author"}],
+    "file_name_author": "",
     "year": 2021,
     "kind": "article",
     "abstract": "We measured knee load at three squat depths.",
@@ -119,7 +120,7 @@ def test_a_document_without_a_doi_is_keyed_by_its_file():
 def test_a_document_without_an_abstract_has_no_vector():
     clickhouse = FakeClickHouse()
 
-    _, llm = run(clickhouse, llm=FakeLLM({**ANSWER, "abstract": "", "authors": []}))
+    _, llm = run(clickhouse, llm=FakeLLM({**ANSWER, "abstract": "", "people": []}))
 
     assert llm.embedded == []
     assert clickhouse.writes[0][1][0]["abstract_embedding"] == []

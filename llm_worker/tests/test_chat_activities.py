@@ -66,8 +66,19 @@ def test_retrieve_embeds_the_question_and_searches_only_its_model():
     # Only the user's files: their current chunks and their names for the files.
     assert "FROM doc_chunks_visible(user_id = {u:String})" in sql and "c.embed_model = {m:String}" in sql
     assert "FROM files_visible(user_id = {u:String})" in sql and "LIMIT 1 BY cityHash64(c.text)" in sql
-    assert parameters == {"q": [0.5, 0.5], "m": "bge-m3", "k": 3, "u": "ann"}
+    assert parameters == {"q": [0.5, 0.5], "m": "bge-m3", "k": 3, "u": "ann", "f": []}
     assert sources == [SOURCES[0]]
+
+
+def test_retrieve_in_a_scope_reads_only_its_files_of_the_visible_ones():
+    clickhouse = FakeClickHouse(rows=[])
+
+    run("retrieve", clickhouse, RetrieveInput(question="what?", user_id="ann", file_ids=["f-2"]))
+
+    [(sql, parameters)] = clickhouse.queries
+    # Over the view of what the user may see: the scope narrows it, never widens it.
+    assert "doc_chunks_visible(user_id = {u:String})" in sql
+    assert "(empty({f:Array(String)}) OR has({f:Array(String)}, c.file_id))" in sql and parameters["f"] == ["f-2"]
 
 
 def test_retrieve_without_a_user_reads_nothing():

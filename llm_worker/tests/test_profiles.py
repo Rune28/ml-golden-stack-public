@@ -7,10 +7,13 @@ from temporalio.exceptions import ApplicationError
 from rag.profiles import profile_from
 from rag.topics import KINDS, map_prompt, route_prompt, similar_prompt
 from workflow import profiles
+from workflow.profiles import check
 
 # The prompts as they were written in rag.topics before profiles, measured
-# on the model on 2026-10-21. The philosophy profile must give them byte for
-# byte: the same words laid out otherwise moved a question to another kind.
+# on the model on 2026-10-21 (the route with aspects on 2026-10-22, every
+# control question right 10 times of 10). The philosophy profile must give
+# them byte for byte: the same words laid out otherwise moved a question to
+# another kind.
 ROUTE_BEFORE = """You decide how to answer a message about the user's documents. Return JSON.
 - kind, one of three:
   interpret: the user tells their own story, dream, experience or thought and asks what it means or how to
@@ -18,6 +21,8 @@ ROUTE_BEFORE = """You decide how to answer a message about the user's documents.
   topic: the user asks what the documents or an author say about a subject, gathered from many passages
   ("что Пруст говорит о смерти?", "что автор имел в виду под топологией пути?", "как Мамардашвили понимает любовь?").
   fact: a definition, a name, a date, a detail ("что такое трансмировая линия?", "кто автор книги?").
+- aspects: when the message lists several subjects to cover one by one ("о A, B и C"), each of them, as
+  written in the message; an empty list when it asks about one subject. No "and other questions".
 - query: what the message asks of the documents, as one short question in the language of the message
   (a message in Russian gets a query in Russian), at most 20 words: the subject and what is asked about it,
   without the story or the examples around it.
@@ -118,3 +123,63 @@ def test_the_layout_of_a_text_is_the_author_s_only_its_ends_are_trimmed():
     data["map"]["attribution"] = "\n say whose\n   words a point is \n"
 
     assert profile_from("p", "v", data).attribution == "say whose\n   words a point is"
+
+
+def test_document_words_are_kept_as_lemmas_and_may_be_left_out():
+    data = valid()
+    data["route"]["document_words"] = ["книги", "Блог", "файл"]
+    assert profile_from("p", "v", data).document_words == {"книга", "блог", "файл"}
+
+    del data["route"]["document_words"]
+    assert profile_from("p", "v", data).document_words == frozenset()
+
+    data["route"]["document_words"] = "книга"
+    with pytest.raises(ValueError, match="route.document_words"):
+        profile_from("p", "v", data)
+
+
+def test_kind_words_are_lemmas_of_kinds_a_document_can_have():
+    data = valid()
+    data["route"]["kind_words"] = {"книги": "book", "заметка": "notes"}
+    assert profile_from("p", "v", data).kind_words == {"книга": "book", "заметка": "notes"}
+
+    data["route"]["kind_words"] = {"блог": "blog"}
+    with pytest.raises(ValueError, match="route.kind_words"):
+        profile_from("p", "v", data)
+
+
+def test_every_control_file_is_of_a_profile_and_wants_known_kinds():
+    names = [f.name.removesuffix(".toml") for f in (resources.files("workflow.profiles") / "control").iterdir()
+             if f.name.endswith(".toml")]
+
+    assert "philosophy" in names
+    for name in names:
+        assert name in profiles.names()
+        check.control(name)  # a broken file fails here, not in a measurement
+
+
+def test_the_route_check_counts_what_route_returns_after_its_rules_in_code(monkeypatch):
+    questions = [check.Question("что Саша думает о жизни, смерти и любви?", "topic", ["жизнь", "смерть", "любовь"]),
+                 check.Question("чем заметки Саши отличаются от книги Мамардашвили?", "compare")]
+    monkeypatch.setattr(check, "control", lambda name: ({"authors": ["Саша", "Мамардашвили"]}, questions))
+
+    class FakeLLM:
+        chat_model = "qwen3:4b"
+
+        def __init__(self, answers):
+            self.answers = answers
+
+        def chat_json(self, messages, schema):
+            return self.answers.pop(0)
+
+    listed = {"kind": "interpret", "aspects": ["жизни", "смерти", "любви"], "query": "q", "terms": []}
+    lost = {"kind": "interpret", "aspects": [], "query": "q", "terms": []}
+    fact = {"kind": "fact", "aspects": [], "query": "q", "terms": []}
+    llm = FakeLLM([listed, lost, fact, fact])
+
+    results = check.measure("philosophy", 2, llm)
+
+    # Aspects make a topic of an interpret; two authors make a comparison of a fact.
+    assert (dict(results[0].kinds), results[0].aspects_right) == ({"topic": 1, "interpret": 1}, 1)
+    assert (dict(results[1].kinds), results[1].aspects_right) == ({"compare": 2}, None)
+    assert check.report("philosophy", 2, llm, results).endswith("right every run: 1 of 2 questions; 3 of 4 runs")

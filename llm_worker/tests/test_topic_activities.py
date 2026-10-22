@@ -1,3 +1,4 @@
+import pytest
 from temporalio.testing import ActivityEnvironment
 
 from rag import topics
@@ -7,17 +8,18 @@ from dataclasses import replace
 from workflow import profiles
 from workflow.activities import topic as topic_module
 from workflow.activities.topic import TopicSteps
-from workflow.contracts import GatherInput, RouteInput, Source, SummarizeInput
+from workflow.contracts import GatherInput, RouteInput, Section, Source, SummarizeInput
 
 
 class FakeClickHouse:
     """mentions: (term, file_id, index_run_id, chunk_id); themes: (term, file_id, name, chunks)
     of themes in more than MAX_SHARE of their document's chunks; vectors: (term, distance)
-    of the stored terms, the same distance to whatever term is looked up."""
+    of the stored terms, the same distance to whatever term is looked up; chunks: (file_id,
+    run_id, chunk_id) of every file, the closest to any question first; authors: by file_id."""
 
-    def __init__(self, mentions=(), themes=(), texts=None, vectors=()):
+    def __init__(self, mentions=(), themes=(), texts=None, vectors=(), chunks=(), authors=None):
         self.mentions, self.themes, self.texts, self.queries = list(mentions), list(themes), texts or {}, []
-        self.vectors = list(vectors)
+        self.vectors, self.chunks, self.authors = list(vectors), list(chunks), authors or {}
 
     def query(self, sql, parameters):
         self.queries.append(sql)
@@ -31,6 +33,12 @@ class FakeClickHouse:
             rows = [t for t in self.themes if t[0] in parameters["t"]]
         elif "FROM files_visible(user_id = {u:String}) WHERE" in sql:
             rows = [[f, f"{f}.txt"] for f in parameters["f"]]
+        elif "FROM documents_visible" in sql:
+            rows = [[f, self.authors.get(f, "")] for f in parameters["f"]]
+        elif "FROM doc_chunks_visible" in sql:  # the nearest of the files: here, in the order given
+            taken = set(parameters["x"])
+            rows = [list(c) for c in self.chunks
+                    if (not parameters["f"] or c[0] in parameters["f"]) and (c[1], c[2]) not in taken][: parameters["n"]]
         elif "cosineDistance" in sql:  # the closest: here, the first n keys
             rows = [[f"f-{r}", r, c] for r, c in parameters["k"][: parameters["n"]]]
         else:  # texts of chunks
@@ -74,8 +82,8 @@ def test_route_reads_a_short_query_then_the_kind_and_its_terms():
                                                                "о чём книга?", "?"])
 
     assert (topic.kind, topic.terms, topic.query) == ("topic", ["сон"], "меняет ли сон человека?")
-    # The kind is read off the whole message, the terms off the query.
-    assert list(topics.ROUTE_SCHEMA["properties"]) == ["kind", "query", "terms"]
+    # The kind and the aspects are read off the whole message, the terms off the query.
+    assert list(topics.ROUTE_SCHEMA["properties"]) == ["kind", "aspects", "query", "terms"]
     # No query: empty, and the workflow uses the message.
     assert (old.kind, old.query) == ("fact", "")
     assert story.kind == "interpret"
@@ -133,6 +141,33 @@ def test_route_says_which_profile_and_version_it_read_the_message_with(monkeypat
     assert (default.profile, default.profile_version) == ("philosophy", profiles.load("philosophy").version)
     assert named.profile == "default"
     assert "Пруст" in llm.prompts[0][0]["content"] and "Пруст" not in llm.prompts[1][0]["content"]
+
+
+def test_terms_that_only_name_documents_are_dropped(monkeypatch):
+    # Asked "trace the author's path in the files blog 1-5", the route gave
+    # путь, автор, файлы блог: автор became писатель, поэт; блог named no chunk.
+    monkeypatch.setenv("LLM_DEFAULT_PROFILE", "philosophy")
+    llm = FakeLLM(answers=[{"kind": "topic", "query": "q", "terms": ["путь", "автор", "файлы блог"]},
+                           {"kind": "topic", "query": "q", "terms": ["время", "книге"]},
+                           {"kind": "topic", "query": "q", "terms": ["книга", "авторы"]}])
+    steps = TopicSteps(lambda: None, llm)
+
+    def route():
+        return ActivityEnvironment().run(steps.route, RouteInput(question="?"))
+
+    path, time, nothing = route(), route(), route()
+
+    assert path.terms == ["путь"] and time.terms == ["время"]
+    # No subject left: a topic with no terms is a fact.
+    assert (nothing.kind, nothing.terms) == ("fact", [])
+
+
+def test_a_term_names_documents_only_when_every_noun_of_it_does():
+    words = frozenset({"автор", "блог", "файл", "книга"})
+
+    assert topics.names_documents("файлы блог", words) and topics.names_documents("книгах", words)
+    assert not topics.names_documents("путь автора", words) and not topics.names_documents("топология пути", words)
+    assert not topics.names_documents("1-5", words)  # no nouns: left to gather, which finds nothing by it
 
 
 def test_how_near_and_how_many_similar_terms_are_the_profile_s(monkeypatch):
@@ -386,3 +421,183 @@ def test_summarize_without_a_user_reads_no_texts():
 
     assert clickhouse.queries == []
     assert all("someone else" not in m["content"] for prompt in llm.prompts for m in prompt)
+
+
+def test_gather_in_a_scope_reads_only_its_files_of_the_visible_ones():
+    clickhouse = FakeClickHouse(mentions=[("сон", "b", "i", 1)], vectors=[("сновидение", 0.2)])
+    steps = TopicSteps(lambda: clickhouse, FakeLLM(answers=[{"same": []}]))
+
+    ActivityEnvironment().run(steps.gather, GatherInput(question="q", terms=["сон"], min_chunks=1, user_id="ann",
+                                                        file_ids=["f-blog"]))
+
+    reads = [sql for sql in clickhouse.queries if any(v in sql for v in ("chunk_mentions", "document_themes", "term_vectors"))]
+    assert len(reads) == 3
+    assert all("_visible(user_id = {u:String})" in sql and "has({f:Array(String)}" in sql for sql in reads)
+
+
+class FacetClickHouse:
+    """The user's documents (authors, kind) and groups (name, id), for where a message looks."""
+
+    def __init__(self, documents, groups):
+        self.documents, self.groups, self.queries = documents, groups, []
+
+    def query(self, sql, parameters):
+        self.queries.append((sql, parameters))
+        rows = self.documents if "documents_visible" in sql else self.groups
+        return type("Result", (), {"result_rows": rows})
+
+
+GROUPS = {"Блоги": "c-blogs", "Лекции о Прусте": "c-lectures"}
+AUTHORS = ["Merab Mamardashvili", "Smith, J. A."]
+KIND_WORDS = profiles.load("philosophy").kind_words
+
+
+@pytest.mark.parametrize("message, want", [
+    ("а проследи путь автора в блогах?", (["c-blogs"], [], [])),
+    ("а проследи путь автора именно файлов блог 1-5?", (["c-blogs"], [], [])),
+    ("что Мамардашвили говорит о времени?", ([], ["Merab Mamardashvili"], [])),
+    ("what does Smith say about squats?", ([], ["Smith, J. A."], [])),
+    ("что я писал в своих заметках о тюрьме культуры?", ([], [], ["notes"])),
+    ("что в книге сказано о времени?", ([], [], ["book"])),
+    ("что говорится в лекциях о Прусте про время?", (["c-lectures"], [], ["book"])),
+    # Where to look is not named: every file.
+    ("что Пруст говорит о смерти?", ([], [], [])),
+    ("что такое трансмировая линия?", ([], [], [])),
+    ("как бы ты описал этот сон? мне снилось, что я лечу над магистралью", ([], [], [])),
+], ids=["group", "group by a file name", "author in Cyrillic", "author with a comma", "kind", "a book",
+        "group and kind", "a subject, not an author", "a fact", "a dream"])
+def test_where_a_message_looks_is_what_it_names_of_the_user_s_own(message, want):
+    # Measured cases: asked of the model with the lists, 3 right of 45.
+    assert topics.where_in(message, GROUPS, AUTHORS, KIND_WORDS, ["book", "notes"]) == want
+
+
+def test_a_kind_the_user_has_no_document_of_narrows_nothing():
+    assert topics.where_in("что в статьях о сне?", GROUPS, AUTHORS, KIND_WORDS, ["book", "notes"]) == ([], [], [])
+
+
+def test_the_route_reads_the_user_s_own_values_for_where_the_message_looks():
+    clickhouse = FacetClickHouse(documents=[[["Merab Mamardashvili"], "book"], [[], "notes"]],
+                                 groups=[["Блоги", "c-blogs"]])
+    llm = FakeLLM(answers=[{"kind": "fact", "query": "q", "terms": []}])
+
+    route = ActivityEnvironment().run(TopicSteps(lambda: clickhouse, llm).route,
+                                      RouteInput(question="проследи путь автора в блогах", user_id="ann",
+                                                 profile="philosophy"))
+
+    assert (route.filters.collections, route.filters.authors, route.filters.kinds) == (["c-blogs"], [], [])
+    # One call to the model, the route itself; and only the user's views are read.
+    assert len(llm.prompts) == 1
+    assert all("_visible(user_id = {u:String})" in sql and p == {"u": "ann"} for sql, p in clickhouse.queries)
+
+
+# Chat 01a16252: "what Саша thinks of life, death, love... and how his notes
+# differ from the book of Мамардашвили".
+COMPARED = "Изучи заметки Саши, что он думает о жизни, смерти, любви и других философских вопросах, " \
+           "и чем заметки Саши отличаются по философии от книги Мамардашвили?"
+
+
+def test_a_message_naming_two_authors_compares_them_and_their_names_are_no_terms():
+    clickhouse = FacetClickHouse(documents=[[["Саша"], "notes"], [["Мамардашвили"], "book"]], groups=[])
+    llm = FakeLLM(answers=[{"kind": "interpret", "query": "чем заметки Саши отличаются",
+                            "terms": ["Саши", "Мамардашвили", "философия"],
+                            "aspects": ["жизнь", "смерть", "любовь", "другие философские вопросы"]}])
+
+    route = ActivityEnvironment().run(TopicSteps(lambda: clickhouse, llm).route,
+                                      RouteInput(question=COMPARED, user_id="ann", profile="philosophy"))
+
+    # Whatever the model read: two sides named compare.
+    assert route.kind == "compare"
+    assert route.terms == ["философия"] and route.aspects == ["жизнь", "смерть", "любовь"]
+    assert [(s.label, s.scope.authors, s.scope.kinds) for s in route.sides] == [
+        ("Мамардашвили", ["Мамардашвили"], ["book", "notes"]), ("Саша", ["Саша"], ["book", "notes"])]
+
+
+def test_aspects_make_a_topic_and_one_side_compares_nothing():
+    clickhouse = FacetClickHouse(documents=[[["Саша"], "notes"]], groups=[])
+    llm = FakeLLM(answers=[{"kind": "interpret", "query": "что Саша думает", "terms": ["Саша"],
+                            "aspects": ["жизнь", "смерть", "любовь"]}])
+
+    route = ActivityEnvironment().run(TopicSteps(lambda: clickhouse, llm).route,
+                                      RouteInput(question="что Саша думает о жизни, смерти и любви?", user_id="ann",
+                                                 profile="philosophy"))
+
+    assert (route.kind, route.terms, route.sides) == ("topic", [], [])
+    assert route.aspects == ["жизнь", "смерть", "любовь"]
+
+
+def test_aspects_are_words_of_the_message_two_or_more_once_each():
+    words = profiles.load("philosophy").document_words
+
+    def aspects(message, given):
+        return topics.aspects_from({"aspects": given}, message, words)
+
+    # Of a dream the model once gave words it never had.
+    assert aspects("мне снилось, что я лечу над магистралью", ["мечта", "мажорность"]) == []
+    assert aspects("о жизни, смерти и других вопросах", ["жизнь", "смерти", "смерть", "другие вопросы"]) == \
+        ["жизнь", "смерти"]
+    # One subject is no list.
+    assert aspects("о смерти и книгах", ["смерть", "книги"]) == []
+
+
+def test_names_authors_only_when_every_word_is_a_surname_of_one():
+    assert topics.names_authors("Саши", ["Саша"])
+    assert topics.names_authors("Mamardashvili", ["Мамардашвили"])
+    assert not topics.names_authors("смерть Саши", ["Саша"])
+    assert not topics.names_authors("Пруст", ["Мамардашвили"])
+
+
+def test_a_part_is_filled_with_the_closest_chunks_of_its_files_when_keywords_are_few():
+    # In 640 chunks of Саша's notes любовь was a keyword of one.
+    clickhouse = FakeClickHouse(mentions=[("любовь", "blog", "i", 5)],
+                                chunks=[("book", "j", 1), ("blog", "i", 5), ("blog", "i", 8), ("blog", "i", 9)])
+    steps = TopicSteps(lambda: clickhouse, FakeLLM())
+
+    gathered = ActivityEnvironment().run(steps.gather, GatherInput(
+        question="любовь", terms=["любовь"], max_chunks=3, user_id="ann", file_ids=["blog"], fill=True))
+
+    assert gathered.mode == "chunks" and gathered.found == 1
+    assert [(s.file_id, s.chunk_id) for s in gathered.sources] == [("blog", 5), ("blog", 8), ("blog", 9)]
+
+
+def test_a_part_with_no_terms_is_the_closest_chunks():
+    clickhouse = FakeClickHouse(chunks=[("blog", "i", 2), ("blog", "i", 3)])
+    steps = TopicSteps(lambda: clickhouse, FakeLLM())
+
+    gathered = ActivityEnvironment().run(steps.gather, GatherInput(
+        question="чем отличаются?", terms=[], max_chunks=5, user_id="ann", fill=True))
+
+    assert [s.chunk_id for s in gathered.sources] == [2, 3]
+
+
+def test_notes_are_marked_with_whose_documents_they_come_from():
+    assert render_notes([(2, "b"), (1, "a")], who={1: "Саша", 2: ""}) == "[1] (Саша) a\n[2] b"
+
+
+def test_a_comparison_is_a_paragraph_per_aspect_with_every_side_and_whose_words_each_note_is():
+    sources = [Source(file_id="blog", index_run_id="i", chunk_id=1, name="блог.txt"),
+               Source(file_id="book", index_run_id="j", chunk_id=2, name="lectures.txt")]
+    sections = [Section(aspect="смерть", side="Саша", passages=[1]), Section(aspect="любовь", side="Саша", passages=[1]),
+                Section(aspect="смерть", side="Мамардашвили", passages=[2]),
+                Section(aspect="любовь", side="Мамардашвили", passages=[2])]
+    llm = FakeLLM(answers=[
+        {"notes": [{"passage": 1, "note": "смерть — конец"}]},
+        {"notes": []},
+        {"notes": [{"passage": 2, "note": "смерть — в жизни"}]},
+        {"notes": []},
+        {"paragraph": "Саша [1], Мамардашвили [2]."},
+    ])
+    clickhouse = FakeClickHouse(authors={"book": "Мамардашвили"})
+
+    generated = ActivityEnvironment().run(TopicSteps(lambda: clickhouse, llm).summarize, SummarizeInput(
+        question=COMPARED, sources=sources, query="чем отличаются", user_id="ann", sections=sections))
+
+    map_death_sasha, map_love_sasha, *_, paragraph = llm.prompts
+    # Notes are taken on the aspect, with whose passage it is, never on the whole message.
+    assert "Question: смерть" in map_death_sasha[0]["content"] and "Саша" not in map_death_sasha[0]["content"]
+    assert map_death_sasha[1]["content"].startswith("[1] Саша · блог.txt")
+    assert "Question: любовь" in map_love_sasha[0]["content"]
+    assert "documents of: Саша, Мамардашвили" in paragraph[0]["content"]
+    assert "Theme: смерть" in paragraph[0]["content"]
+    assert paragraph[1]["content"] == "[1] (Саша) смерть — конец\n[2] (Мамардашвили) смерть — в жизни"
+    # An aspect nobody wrote about is said, not left out.
+    assert generated.text == "**смерть**\nСаша [1], Мамардашвили [2].\n\nВ документах не нашлось ничего о: любовь."

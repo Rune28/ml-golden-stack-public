@@ -12,7 +12,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware;
 use axum::response::{Html, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
@@ -49,10 +49,18 @@ pub fn router<S: AuthStore>(app: Arc<App<S>>) -> Router {
         .route("/api/auth/me", get(login::me))
         .route("/api/files", get(list_files::<S>).post(upload_file::<S>).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)))
         .route("/api/files/{file_id}", delete(delete_file::<S>))
+        .route("/api/files/{file_id}/document", put(put_document::<S>))
+        .route("/api/collections", get(list_collections::<S>).post(new_collection::<S>))
+        .route("/api/collections/{collection_id}", put(change_collection::<S>))
+        .route(
+            "/api/collections/{collection_id}/files/{file_id}",
+            post(add_to_collection::<S>).delete(remove_from_collection::<S>),
+        )
         .route("/api/documents", get(list_documents::<S>))
         .route("/api/chats", get(list_chats::<S>).post(new_chat::<S>))
         .route("/api/chats/{chat_id}/messages", get(chat_history::<S>).post(send_message::<S>))
         .route("/api/profiles", get(list_profiles::<S>))
+        .route("/api/facets", get(list_facets::<S>))
         .route("/healthz", get(|| async { "ok" }))
         .layer(middleware::from_fn_with_state(app.clone(), login::guard::<S>))
         .with_state(app)
@@ -65,9 +73,13 @@ async fn list_files<S: AuthStore>(State(app): State<Arc<App<S>>>, Extension(sess
 #[derive(Deserialize)]
 struct UploadQuery {
     name: String,
+    /// What the user says of the whole batch; the platform checks them.
+    author: Option<String>,
+    kind: Option<String>,
 }
 
-/// The file as the body, its name in the query: the platform checks both.
+/// The file as the body, its name (and what the user says of it) in the
+/// query: the platform checks them all.
 async fn upload_file<S: AuthStore>(
     State(app): State<Arc<App<S>>>,
     Extension(session): Extension<Session>,
@@ -75,7 +87,86 @@ async fn upload_file<S: AuthStore>(
     body: Bytes,
 ) -> Response {
     let body = Body { bytes: body, content_type: "application/octet-stream" };
-    app.platform.call(session.user.user_id, Method::POST, "/api/files", &[("name", &q.name)], Some(body), UPLOAD).await
+    let mut query = vec![("name", q.name.as_str())];
+    query.extend(q.author.as_deref().map(|a| ("author", a)));
+    query.extend(q.kind.as_deref().map(|k| ("kind", k)));
+    app.platform.call(session.user.user_id, Method::POST, "/api/files", &query, Some(body), UPLOAD).await
+}
+
+/// The user's correction of a document, `{"authors": [...], ...}` as it
+/// came; the platform checks it and that the file is theirs.
+async fn put_document<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+    Path(file_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Some(refused) = refuse_path_id("file_id", &file_id) {
+        return refused;
+    }
+    let body = Body { bytes: body, content_type: "application/json" };
+    let path = format!("/api/files/{file_id}/document");
+    app.platform.call(session.user.user_id, Method::PUT, &path, &[], Some(body), QUICK).await
+}
+
+async fn list_collections<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+) -> Response {
+    app.platform.call(session.user.user_id, Method::GET, "/api/collections", &[], None, QUICK).await
+}
+
+async fn new_collection<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+    body: Bytes,
+) -> Response {
+    let body = Body { bytes: body, content_type: "application/json" };
+    app.platform.call(session.user.user_id, Method::POST, "/api/collections", &[], Some(body), QUICK).await
+}
+
+async fn change_collection<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+    Path(collection_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Some(refused) = refuse_path_id("collection_id", &collection_id) {
+        return refused;
+    }
+    let body = Body { bytes: body, content_type: "application/json" };
+    let path = format!("/api/collections/{collection_id}");
+    app.platform.call(session.user.user_id, Method::PUT, &path, &[], Some(body), QUICK).await
+}
+
+async fn add_to_collection<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+    Path((collection_id, file_id)): Path<(String, String)>,
+) -> Response {
+    place(app, session, Method::POST, collection_id, file_id).await
+}
+
+async fn remove_from_collection<S: AuthStore>(
+    State(app): State<Arc<App<S>>>,
+    Extension(session): Extension<Session>,
+    Path((collection_id, file_id)): Path<(String, String)>,
+) -> Response {
+    place(app, session, Method::DELETE, collection_id, file_id).await
+}
+
+async fn place<S: AuthStore>(
+    app: Arc<App<S>>,
+    session: Session,
+    method: Method,
+    collection_id: String,
+    file_id: String,
+) -> Response {
+    if let Some(refused) = refuse_path_id("collection_id", &collection_id).or(refuse_path_id("file_id", &file_id)) {
+        return refused;
+    }
+    let path = format!("/api/collections/{collection_id}/files/{file_id}");
+    app.platform.call(session.user.user_id, method, &path, &[], None, QUICK).await
 }
 
 /// An id from the browser that goes into the platform's path must not be
@@ -91,6 +182,11 @@ async fn list_profiles<S: AuthStore>(
     Extension(session): Extension<Session>,
 ) -> Response {
     app.platform.call(session.user.user_id, Method::GET, "/api/profiles", &[], None, QUICK).await
+}
+
+/// What the user's documents can be scoped by: the platform's facets.
+async fn list_facets<S: AuthStore>(State(app): State<Arc<App<S>>>, Extension(session): Extension<Session>) -> Response {
+    app.platform.call(session.user.user_id, Method::GET, "/api/facets", &[], None, QUICK).await
 }
 
 async fn list_documents<S: AuthStore>(
@@ -166,6 +262,50 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         url
+    }
+
+    #[tokio::test]
+    async fn passes_the_library_on_as_it_came() {
+        let echo = |method: &'static str| {
+            move |uri: axum::http::Uri, body: String| async move {
+                Json(json!({ "method": method, "path": uri.path(), "query": uri.query(), "got": body }))
+            }
+        };
+        let url = fake_platform(
+            Router::new()
+                .route("/api/files", post(echo("POST")))
+                .route("/api/files/{id}/document", put(echo("PUT")))
+                .route("/api/collections", post(echo("POST")))
+                .route("/api/collections/{id}/files/{file}", post(echo("POST")).delete(echo("DELETE"))),
+        )
+        .await;
+
+        let upload = Request::post("/api/files?name=a.md&author=%D0%AF&kind=notes").body(HttpBody::from("text"));
+        let (_, got) = call(&url, upload.unwrap()).await;
+        assert_eq!(got["query"], json!("name=a.md&author=%D0%AF&kind=notes"));
+
+        let edit = Request::put("/api/files/abc/document")
+            .header("content-type", "application/json")
+            .body(HttpBody::from(r#"{"kind":"notes"}"#));
+        let (_, got) = call(&url, edit.unwrap()).await;
+        assert_eq!(
+            (got["path"].clone(), got["got"].clone()),
+            (json!("/api/files/abc/document"), json!(r#"{"kind":"notes"}"#))
+        );
+
+        let (_, got) = call(&url, post_json("/api/collections", r#"{"name":"Блоги"}"#)).await;
+        assert_eq!(got["got"], json!(r#"{"name":"Блоги"}"#));
+
+        let out = Request::delete("/api/collections/c-1/files/abc").body(HttpBody::empty()).unwrap();
+        let (_, got) = call(&url, out).await;
+        assert_eq!(
+            (got["method"].clone(), got["path"].clone()),
+            (json!("DELETE"), json!("/api/collections/c-1/files/abc"))
+        );
+
+        // An id that would change the platform's path never reaches it.
+        let (status, _) = call(&url, post_json("/api/collections/..%2Fchats/files/abc", "")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// A call of a logged-in user from the page: a session cookie and the page's origin.

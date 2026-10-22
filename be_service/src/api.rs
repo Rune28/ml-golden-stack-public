@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use crate::auth::{User, Verifier};
 use crate::files::{self, ObjectStore};
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
+use crate::library;
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
 use crate::profiles::Profiles;
@@ -59,10 +60,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/files", post(upload_file).layer(DefaultBodyLimit::max(files::MAX_FILE_BYTES)).get(list_files))
         .route("/api/files/{file_id}", delete(delete_file))
         .route("/api/files/{file_id}/index", post(index_file))
+        .route("/api/files/{file_id}/document", put(library::put_document))
         .route("/api/documents", get(list_documents))
+        .route("/api/collections", get(library::list_collections).post(library::new_collection))
+        .route("/api/collections/{collection_id}", put(library::change_collection))
+        .route(
+            "/api/collections/{collection_id}/files/{file_id}",
+            post(library::add_to_collection).delete(library::remove_from_collection),
+        )
         .route("/api/chats", post(new_chat).get(list_chats))
         .route("/api/chats/{chat_id}/messages", post(send_message).get(chat_history))
         .route("/api/profiles", get(list_profiles))
+        .route("/api/facets", get(library::list_facets))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -182,6 +191,10 @@ async fn start(state: &AppState, pipeline: Pipeline, input: Value) -> Result<Jso
 #[derive(Deserialize)]
 struct UploadQuery {
     name: String,
+    /// What the user says of the whole batch: one author, a kind. Kept as
+    /// their correction of each file's document (library.rs).
+    author: Option<String>,
+    kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -213,14 +226,21 @@ async fn upload_file(
     body: Bytes,
 ) -> Result<Json<Uploaded>, ApiError> {
     files::validate(&q.name, &body).map_err(ApiError::BadRequest)?;
+    let said = library::upload_edit(q.author.as_deref(), q.kind.as_deref()).map_err(ApiError::BadRequest)?;
     let file_id = files::sha256_hex(&body);
     let size = body.len() as u64;
 
     if let Some(mine) = state.store.visible(&user).file(&file_id).await? {
+        if let Some(said) = &said {
+            library::save_edit(&state, &user, &file_id, said).await?;
+        }
         return Ok(Json(Uploaded { file_id, name: mine.name, size: mine.size, duplicate: true, index: None }));
     }
     if state.store.stored_file(&file_id).await?.is_some() {
         state.store.add_owner(&user, &file_id, &q.name).await?;
+        if let Some(said) = &said {
+            library::save_edit(&state, &user, &file_id, said).await?;
+        }
         tracing::info!(%file_id, %user, "file linked to another owner");
         return Ok(Json(Uploaded { file_id, name: q.name, size, duplicate: false, index: None }));
     }
@@ -231,6 +251,9 @@ async fn upload_file(
     state.objects.put(&object_key, body).await?;
     state.store.insert_file(&file_id, &q.name, size, &object_key).await?;
     state.store.add_owner(&user, &file_id, &q.name).await?;
+    if let Some(said) = &said {
+        library::save_edit(&state, &user, &file_id, said).await?;
+    }
 
     tracing::info!(%file_id, %user, name = %q.name, size, "file uploaded");
     let index = match start_index(&state, &file_id).await {
@@ -367,7 +390,7 @@ async fn list_documents(
     User(user): User,
     Query(q): Query<DocumentsQuery>,
 ) -> Result<Json<Vec<DocumentRow>>, ApiError> {
-    Ok(Json(state.store.visible(&user).documents(100, q.top.min(100)).await?))
+    Ok(Json(state.store.visible(&user).documents(None, 200, q.top.min(100)).await?))
 }
 
 #[derive(Serialize)]
@@ -461,6 +484,10 @@ struct MessageRequest {
     /// worker's default. The first message that names one fixes it for the chat.
     #[serde(default)]
     profile: String,
+    /// Where the chat looks (library.rs, ScopeRequest); empty: every file
+    /// of the user. The first message that names one fixes it for the chat.
+    #[serde(default)]
+    scope: library::ScopeRequest,
 }
 
 /// One message of a chat, answered from the uploaded files:
@@ -485,12 +512,14 @@ async fn send_message(
     if let Some(refused) = state.profiles.refusal(&req.profile) {
         return Err(ApiError::BadRequest(refused));
     }
+    library::check_scope(&req.scope).map_err(ApiError::BadRequest)?;
     if !state.store.visible(&user).owns_chat(&chat_id).await? {
         return Err(ApiError::NotFound(format!("no chat {chat_id}")));
     }
     // The answer's run, made where the request enters the platform (principle 5).
     let run_id = uuid::Uuid::now_v7().to_string();
-    match state.temporal.send_message(&chat_id, &run_id, text, &user, &req.profile).await {
+    let scope = serde_json::to_value(&req.scope).map_err(|e| ApiError::Internal(e.into()))?;
+    match state.temporal.send_message(&chat_id, &run_id, text, &user, &req.profile, &scope).await {
         Ok(answer) => Ok(Json(answer)),
         Err(UpdateError::Failed(message)) => Err(ApiError::Upstream(message)),
         Err(UpdateError::Other(e)) => Err(ApiError::Internal(e)),
@@ -625,7 +654,7 @@ fn validate_batch_id(id: String) -> Result<String, ApiError> {
 }
 
 /// A run id sent by a client: 1-64 letters, digits, '-' or '_'.
-fn validate_run_id(field: &str, id: String) -> Result<String, ApiError> {
+pub(crate) fn validate_run_id(field: &str, id: String) -> Result<String, ApiError> {
     let well_formed =
         (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     if !well_formed {
@@ -751,10 +780,39 @@ mod tests {
         assert_eq!(message("chat-1", &long).await, StatusCode::BAD_REQUEST);
         assert_eq!(message("a%20b", r#"{"text": "hi"}"#).await, StatusCode::BAD_REQUEST);
         assert_eq!(message("chat-1", r#"{}"#).await, StatusCode::UNPROCESSABLE_ENTITY);
+        let scope = serde_json::json!({ "text": "hi", "scope": { "kinds": ["blog"] } }).to_string();
+        assert_eq!(message("chat-1", &scope).await, StatusCode::BAD_REQUEST);
         for profile in ["../secrets", "fitness"] {
             let body = serde_json::json!({ "text": "hi", "profile": profile }).to_string();
             assert_eq!(message("chat-1", &body).await, StatusCode::BAD_REQUEST, "{profile}");
         }
+    }
+
+    async fn send(method: &str, path: &str, body: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", bearer())
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()));
+        app().oneshot(req.unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn refuses_a_correction_or_a_group_that_cannot_be_kept_before_any_lookup() {
+        // The store of the test app is unreachable: a request that got to it would be a 500.
+        assert_eq!(send("PUT", "/api/files/abc/document", r#"{"kind": "poem"}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(send("PUT", "/api/files/a%20b/document", r#"{}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            send("PUT", "/api/files/abc/document", r#"{"owner": "bob"}"#).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(send("POST", "/api/collections", r#"{"name": " "}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(send("PUT", "/api/collections/c-1", r#"{"name": ""}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(send("POST", "/api/collections/a%20b/files/abc", "").await, StatusCode::BAD_REQUEST);
+        let req =
+            Request::post("/api/files?name=a.md&kind=blog").header("authorization", bearer()).body(Body::from("text"));
+        assert_eq!(app().oneshot(req.unwrap()).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -800,6 +858,13 @@ mod tests {
             ("GET", "/api/chats/c-1/messages"),
             ("POST", "/api/chats/c-1/messages"),
             ("GET", "/api/profiles"),
+            ("GET", "/api/facets"),
+            ("PUT", "/api/files/abc/document"),
+            ("GET", "/api/collections"),
+            ("POST", "/api/collections"),
+            ("PUT", "/api/collections/c-1"),
+            ("POST", "/api/collections/c-1/files/abc"),
+            ("DELETE", "/api/collections/c-1/files/abc"),
         ] {
             for auth in [None, Some("Bearer not-a-token".to_owned()), Some(format!("Bearer {expired}"))] {
                 let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");

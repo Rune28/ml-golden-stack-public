@@ -1,0 +1,81 @@
+# Control questions of the philosophy profile: what route must make of each.
+# Measured with `make route-check P=philosophy` before a change to the profile
+# or to a prompt of rag.topics is released (llm_worker/CLAUDE.md, Profiles).
+#
+# kind: what route returns, the rules in code included (compare is set by
+# them, never by the model). aspects, where given: each of them must be among
+# the aspects route reads, compared by stored form; an empty list: none.
+#
+# Not a part of the profile: its version (a hash of its file) stays the same
+# when a question is added here.
+
+# The user's own documents the questions are routed over: where_in picks
+# among them, and two authors make a comparison.
+[facets]
+authors = ["Саша", "Мамардашвили"]
+kinds = ["book", "notes"]
+groups = ["Блоги"]
+
+# Dreams: told "fact otherwise, and any story of the user's" instead of a
+# kind of its own, the model sent every one to a topic, 20 of 20 (2026-10-21).
+[[question]]
+text = "как бы ты описал этот сон? мне снилось, что я лечу над магистралью"
+kind = "interpret"
+aspects = []
+
+[[question]]
+text = "то есть во сне отыгрывается страх?"
+kind = "interpret"
+aspects = []
+
+[[question]]
+text = "мне снилось, что я в большом доме и не могу найти выход, что это значит?"
+kind = "interpret"
+aspects = []
+
+[[question]]
+text = "что Пруст говорит о смерти?"
+kind = "topic"
+aspects = []
+
+[[question]]
+text = "что автор имел в виду под топологией пути?"
+kind = "topic"
+
+[[question]]
+text = "как Мамардашвили понимает любовь?"
+kind = "topic"
+
+[[question]]
+text = "что такое трансмировая линия?"
+kind = "fact"
+
+[[question]]
+text = "кто автор книги?"
+kind = "fact"
+
+# On the edge between a fact and a topic: 57 of 60 with the rest (2026-10-22).
+[[question]]
+text = "что такое пирожное мадлен у Пруста?"
+kind = "fact"
+
+# Aspects: chat 01a16252, answered as one mix before there were any.
+[[question]]
+text = "что Саша думает о жизни, смерти и любви?"
+kind = "topic"
+aspects = ["жизнь", "смерть", "любовь"]
+
+[[question]]
+text = "что в книге сказано о времени, памяти и привычке?"
+kind = "topic"
+aspects = ["время", "память", "привычка"]
+
+# Comparisons: two authors named.
+[[question]]
+text = "Изучи заметки Саши, что он думает о жизни, смерти, любви и других филосфоских вопросах, и давай посмотрим, чем заметки Саши отличаются по философии от книги Мамардашвили?"
+kind = "compare"
+aspects = ["жизнь", "смерть", "любовь"]
+
+[[question]]
+text = "чем заметки Саши отличаются от книги Мамардашвили?"
+kind = "compare"

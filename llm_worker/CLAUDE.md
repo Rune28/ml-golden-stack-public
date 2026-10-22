@@ -1,6 +1,6 @@
 # llm_worker
 
-Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). The workflow `Index` with its activities `index_file`, `read_document` and `extract_mentions`, and the entity workflow `Chat` (one per conversation, a message is an Update) with `route`, then `gather` and `summarize` for a topic or `retrieve` and `generate` for a fact, and `record`. `route` tells a fact, a topic, or the user's own story to interpret (answered as a fact: retrieved by the message as written) and reads a short query a topic is gathered and themed by. No Kubernetes client: this worker starts no Jobs.
+Temporal worker of the `llm` task queue: events processed in the worker as they come, against the long-running model server (principle 3). The workflow `Index` with its activities `index_file`, `read_document` and `extract_mentions`, and the entity workflow `Chat` (one per conversation, a message is an Update) with `route`, then `gather` and `summarize` for a topic or `retrieve` and `generate` for a fact, and `record`. `route` tells a fact, a topic, or the user's own story to interpret (answered as a fact: retrieved by the message as written) and reads a short query a topic is gathered and themed by. A message that lists aspects (жизнь, смерть, любовь) or names two or more of the user's authors, groups or kinds (`compare`) is answered in sections: each aspect in each side's documents gathered apart with a share of the chunks (`gather` with `fill`), then a paragraph per aspect, each note marked with whose documents it is from. No Kubernetes client: this worker starts no Jobs.
 
 `rag` is chunking, PDF text and the keys and metadata of documents, with no I/O (principle 2); `workflow/llm.py` is the adapter to the model server.
 
@@ -9,8 +9,9 @@ Temporal worker of the `llm` task queue: events processed in the worker as they 
 What depends on the corpus is a profile, a file in `src/workflow/profiles/` (`rag/profiles.py` says what it holds): what counts as a fact, a topic and a story to interpret, with examples; how to pick the terms; examples and thresholds of synonyms; whose words a passage gives. The steps and the prompt templates in `rag/topics.py` are the same for every corpus.
 
 - A chat's profile is fixed by its first message that names one, or by the default its first route resolved (`LLM_DEFAULT_PROFILE`, else `default`). The workflow carries the name; activities read the file. route returns the name and the version (a hash of the file) into the workflow history.
-- The texts go into the prompts exactly as written, line breaks included: for qwen3:4b the layout moved a question between kinds. An edit of a profile is a new version: measure the route on that corpus's control questions (5 runs a question) before the release, as for a prompt in code.
-- The kinds themselves (`KINDS`) are code, not profile: each is a path in the workflow. A new kind is a change to the workflow.
+- The texts go into the prompts exactly as written, line breaks included: for qwen3:4b the layout moved a question between kinds. An edit of a profile is a new version: measure the route on that corpus's control questions (5 runs a question) before the release, as for a prompt in code: `make route-check P=<profile>`, the questions in `src/workflow/profiles/control/<profile>.toml`. A question that went wrong in a chat goes there.
+- The kinds themselves (`KINDS`) are code, not profile: each is a path in the workflow. A new kind is a change to the workflow. `compare` is not asked of the model: route sets it when the message names two sides (`sides_of`).
+- What a small model is told not to do, it often does: a rule that can be checked in code (such as `document_words`, terms that only name documents) is enforced in the activity, not left to the prompt.
 
 ## Workflows and contracts
 
@@ -29,8 +30,9 @@ What depends on the corpus is a profile, a file in `src/workflow/profiles/` (`ra
 
 ## What a user may read
 
-- Every message carries the `user_id` be_service took from the platform token, and every step of an answer gets it in its input. The steps read user data only through the views `*_visible(user_id = {u:String})` and, for texts by key, `doc_chunks_owned` (db/CLAUDE.md); an empty `user_id` reads nothing. `tests/test_visible.py` fails when `activities/chat.py` or `topic.py` names a table or a current view of user data.
+- Every message carries the `user_id` be_service took from the platform token, and every step of an answer gets it in its input. The steps read user data only through the views `*_visible(user_id = {u:String})` and, for texts by key, `doc_chunks_owned` (db/CLAUDE.md); an empty `user_id` reads nothing. `tests/test_visible.py` fails when `activities/chat.py`, `topic.py` or `scope.py` names a table or a current view of user data.
 - The workflow `Chat` keeps no identity: a message is authorized when it comes.
+- A chat's scope (`Scope`: groups, authors, kinds, years, files; docs/search-scope-plan.md) is resolved to files by `resolve_scope` through `documents_visible` and `collections_visible`, every message. The steps that search add `empty(f) OR has(f, file_id)` over their `*_visible` reads: a scope narrows what the user may see, never widens it, and a scope of no file is answered as such, not from every file. What a message names itself ("в блогах", "у Мамардашвили", "в книге") narrows it further: matched on the words (`rag.topics.where_in`), since asked of the model with the lists it picked them all.
 
 ## Retry safety (principles 4, 5)
 

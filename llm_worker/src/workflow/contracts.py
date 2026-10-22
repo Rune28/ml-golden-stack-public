@@ -74,6 +74,25 @@ class ChatMessage:
 
 
 @dataclass
+class Scope:
+    """Where an answer may look, among the user's files (docs/search-scope-plan.md):
+    the files of these groups, by these authors, of these kinds, of these
+    years, or these files. Facets narrow each other (and); the values of one
+    facet widen it (or). Empty: every file the user may see."""
+
+    file_ids: list[str] = field(default_factory=list)
+    collections: list[str] = field(default_factory=list)  # collection ids
+    authors: list[str] = field(default_factory=list)
+    kinds: list[str] = field(default_factory=list)
+    year_from: int | None = None
+    year_to: int | None = None
+
+    def empty(self) -> bool:
+        return not (self.file_ids or self.collections or self.authors or self.kinds
+                    or self.year_from is not None or self.year_to is not None)
+
+
+@dataclass
 class ChatInput:
     # Made by be_service (POST /api/chats); the workflow ID is chat-<chat_id>.
     chat_id: str
@@ -91,6 +110,9 @@ class ChatInput:
     # message that names one, or by the route of the first message, which
     # resolves the default; carried over by continue-as-new.
     profile: str = ""
+    # Where the chat looks: fixed by the first message that names a scope,
+    # carried over by continue-as-new.
+    scope: Scope = field(default_factory=Scope)
 
 
 @dataclass
@@ -106,6 +128,9 @@ class MessageInput:
     # The profile asked for (be_service checked its form); it counts only
     # while the chat has none.
     profile: str = ""
+    # The scope asked for (be_service checked it); it counts only while the
+    # chat has none.
+    scope: Scope = field(default_factory=Scope)
 
 
 @dataclass
@@ -128,6 +153,8 @@ class Answer:
     model: str
     # The profile of the chat, for the page to show what the answer was made with.
     profile: str = ""
+    # What the answer was looked for in ("4 files: group Блоги"); empty: everywhere.
+    scope_label: str = ""
 
 
 @dataclass
@@ -135,6 +162,8 @@ class RetrieveInput:
     question: str
     k: int = 5
     user_id: str = ""
+    # Only these of the user's files (the chat's scope, resolved); empty: all of them.
+    file_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -166,11 +195,23 @@ class RouteInput:
     question: str
     # The profile of the chat (workflow.profiles); empty: the worker's default.
     profile: str = ""
+    # Whose groups, authors and kinds the message may narrow its search to.
+    user_id: str = ""
+
+
+@dataclass
+class Side:
+    """One of the things a message compares: an author, a group or a kind of
+    the user's documents it names, and the scope that is its documents."""
+
+    label: str
+    scope: Scope = field(default_factory=Scope)
 
 
 @dataclass
 class Route:
-    # fact | topic | interpret (the user's own story: answered as a fact).
+    # fact | topic | interpret (the user's own story: answered as a fact) |
+    # compare (set in code: the message names two or more sides).
     kind: str = "fact"
     # The words of the query that name the topic.
     terms: list[str] = field(default_factory=list)
@@ -182,6 +223,14 @@ class Route:
     # its file): what this answer was made with. Empty before profiles.
     profile: str = ""
     profile_version: str = ""
+    # Where the message itself narrows the search, among the user's own
+    # groups, authors and kinds ("in my blogs"); empty: it does not.
+    filters: Scope = field(default_factory=Scope)
+    # The subjects the message lists to be answered one by one (жизнь,
+    # смерть, любовь): a section of the answer each. Fewer than two: none.
+    aspects: list[str] = field(default_factory=list)
+    # What a compare message compares (two or more), from filters.
+    sides: list[Side] = field(default_factory=list)
 
 
 @dataclass
@@ -194,6 +243,13 @@ class GatherInput:
     user_id: str = ""
     # The profile of the chat (workflow.profiles); empty: the worker's default.
     profile: str = ""
+    # Only these of the user's files (the chat's scope, resolved); empty: all of them.
+    file_ids: list[str] = field(default_factory=list)
+    # Take max_chunks whatever the keywords give: their chunks first, the
+    # closest to the question for the rest. For a part of a sectioned answer,
+    # which has to say something on its subject even where the documents
+    # never use its word.
+    fill: bool = False
 
 
 @dataclass
@@ -221,6 +277,16 @@ class Gathered:
 
 
 @dataclass
+class Section:
+    """The passages gathered for one aspect of a question, in the documents
+    of one side; either may be empty."""
+
+    aspect: str = ""
+    side: str = ""
+    passages: list[int] = field(default_factory=list)
+
+
+@dataclass
 class SummarizeInput:
     # The message as written: the notes are taken on what it asks.
     question: str
@@ -231,3 +297,22 @@ class SummarizeInput:
     user_id: str = ""
     # The profile of the chat (workflow.profiles); empty: the worker's default.
     profile: str = ""
+    # An answer in sections (an aspect, a side, or both): which passages
+    # (numbers of sources, from 1) each was gathered for. Empty: one topic.
+    sections: list[Section] = field(default_factory=list)
+
+
+@dataclass
+class ScopeInput:
+    user_id: str
+    # The chat's scope, then what the message narrows it to: both hold.
+    scope: Scope = field(default_factory=Scope)
+    narrow: Scope = field(default_factory=Scope)
+
+
+@dataclass
+class Scoped:
+    """The user's files a scope comes to, and how to say what it was."""
+
+    file_ids: list[str] = field(default_factory=list)
+    label: str = ""

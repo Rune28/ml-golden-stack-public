@@ -31,6 +31,15 @@ terms = """the subject asked about first (смерть, любовь,
   сон), then a name or a word that narrows it (Пруст). Never only a name: "что Пруст говорит о смерти?"
   gives смерти, Пруст."""
 
+# The words that name the documents, not what is asked about them: a term
+# made of them only is dropped in code (rag.profiles, document_words).
+document_words = ["автор", "файл", "блог", "книга", "статья", "текст", "документ"]
+
+# Words a message names a kind of document by: "что в книге сказано о времени"
+# looks in books only (rag.topics.where_in). A group or an author it names
+# narrows it the same way, by the user's own names for them.
+kind_words = { "книга" = "book", "лекция" = "book", "заметка" = "notes", "статья" = "article" }
+
 # Cosine distance of bge-m3. The model let through what was close enough to
 # be offered: at 0.4, сон → соната (0.36), просыпание (0.33), бодрствование
 # (0.38) and транссибирская магистраль → трансмировая линия (0.34). Synonyms

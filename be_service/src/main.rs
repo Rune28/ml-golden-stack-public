@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod files;
 mod ingest;
+mod library;
 mod mlflow;
 mod mnist;
 mod profiles;

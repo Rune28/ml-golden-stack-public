@@ -26,7 +26,7 @@ endif
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         stores-init stores-plan stores-up stores-down \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run report llm-check upload files documents reindex-all chat user-add user-password token adopt-orphans auth-check chat-ui chat-ui-service k9s \
+        images images-load app-status add-data train run report llm-check route-check upload files documents reindex-all chat user-add user-password token adopt-orphans auth-check chat-ui chat-ui-service k9s \
         preflight check-owner host-setup test fmt validate
 
 help:
@@ -51,6 +51,7 @@ help:
 	@echo "run MODEL=champion  start the Run workflow"
 	@echo "report           start the Report workflow on the latest prediction run"
 	@echo "llm-check        one answer and one embedding from the LLM server, from inside the cluster"
+	@echo "route-check P=philosophy  the route of a profile on its control questions, local code against the host's model server"
 	@echo "upload FILE=...  upload a text or PDF file for retrieval: stored, then indexed (Index workflow)"
 	@echo "files            uploaded files and the state of their index"
 	@echo "documents        documents read from the files: title, authors, year, keywords"
@@ -184,6 +185,19 @@ report:
 # for it (llm.llm.svc), the models and the adapter in one call.
 llm-check:
 	$(KUBECTL) -n llm-worker exec deploy/llm-worker -- python -m workflow.llm
+
+# The route of a profile on its control questions
+# (llm_worker/src/workflow/profiles/control), with the local code against the
+# model server on the host: before a change to a profile or a prompt is
+# released, not after (llm_worker/CLAUDE.md, Profiles).
+LLM_URL   ?= http://172.18.0.1:11434/v1
+LLM_CHAT  ?= qwen3:4b
+LLM_EMBED ?= bge-m3
+RUNS      ?= 5
+route-check:
+	@test -n "$(P)" || { echo "usage: make route-check P=philosophy [RUNS=5]"; exit 1; }
+	cd llm_worker && LLM_BASE_URL=$(LLM_URL) LLM_CHAT_MODEL=$(LLM_CHAT) LLM_EMBED_MODEL=$(LLM_EMBED) \
+	  uv run python -m workflow.profiles.check $(P) $(RUNS)
 
 # Users of the chat page are created by an admin: whoever has kubectl on the
 # cluster. The password is read here without echo and goes to the command in

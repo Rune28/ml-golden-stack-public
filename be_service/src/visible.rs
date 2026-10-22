@@ -1,6 +1,6 @@
 //! What a user may see, and every read of user data: files, documents,
 //! chats and their turns. These reads go only through the *_visible views
-//! of ClickHouse (migrations 0030-0038), which take the user_id of the
+//! of ClickHouse (migrations 0030-0038, 0042-0043), which take the user_id of the
 //! request and join the owner links: a read that forgot the user cannot get
 //! past them, and without the parameter a query fails instead of reading
 //! everyone's rows. A test below fails when this file names a table or a
@@ -15,7 +15,7 @@ use anyhow::Result;
 use clickhouse::{Client, Row};
 use serde::Deserialize;
 
-use crate::store::{ChatMessageRow, ChatSummary, DocumentRow, FileRow, StoredFile};
+use crate::store::{ChatMessageRow, ChatSummary, CollectionRow, DocumentFacet, DocumentRow, FileRow, StoredFile};
 
 /// The reads of one user.
 pub struct Visible<'a> {
@@ -74,35 +74,64 @@ impl Visible<'_> {
         Ok(rows.into_iter().map(|r| (r.file_id, r.name)).collect())
     }
 
-    /// Documents of the user's files, the latest read first. A preprint and
-    /// the published version of a paper, both the user's, are one document.
-    pub async fn documents(&self, limit: u64, top_themes: u32) -> Result<Vec<DocumentRow>> {
+    /// The user's files as documents, the latest upload first: their
+    /// corrections over what read_document found (documents_visible), with
+    /// the top themes of each file. With a file_id, only that file.
+    pub async fn documents(&self, file_id: Option<&str>, limit: u64, top_themes: u32) -> Result<Vec<DocumentRow>> {
         Ok(self
             .client
             .query(
-                "SELECT d.document_id AS document_id, d.title AS title, d.year AS year, d.kind AS kind, \
-                 d.keywords AS keywords, a.authors AS authors, d.files AS files, t.themes AS themes FROM ( \
-                   SELECT s.document_id AS document_id, argMax(s.run_id, r.started_at) AS run_id, \
-                   argMax(s.file_id, r.started_at) AS file_id, \
-                   argMax(s.title, r.started_at) AS title, argMax(s.year, r.started_at) AS year, \
-                   argMax(s.kind, r.started_at) AS kind, argMax(s.keywords, r.started_at) AS keywords, \
-                   groupUniqArray(s.file_id) AS files, max(r.started_at) AS read_at \
-                   FROM sat_document_visible(user_id = ?) AS s \
-                   INNER JOIN (SELECT run_id, started_at FROM runs FINAL WHERE kind = 'document') AS r \
-                   ON r.run_id = s.run_id GROUP BY s.document_id) AS d \
-                 LEFT JOIN (SELECT run_id, arrayMap(p -> p.2, arraySort(groupArray((position, name)))) AS authors \
-                   FROM link_document_author_visible(user_id = ?) GROUP BY run_id) AS a ON a.run_id = d.run_id \
+                "SELECT d.file_id AS file_id, d.name AS name, d.document_id AS document_id, \
+                 toBool(d.document_run_id != '') AS read, d.title AS title, d.title_source AS title_source, \
+                 d.authors AS authors, d.authors_source AS authors_source, d.kind AS kind, \
+                 d.kind_source AS kind_source, d.year AS year, d.year_source AS year_source, \
+                 d.confirmed AS confirmed, d.keywords AS keywords, d.collection_ids AS collection_ids, \
+                 t.themes AS themes, toUInt32(toUnixTimestamp(d.uploaded_at)) AS uploaded_at \
+                 FROM documents_visible(user_id = ?) AS d \
                  LEFT JOIN (SELECT file_id, arrayMap(p -> p.2, arraySort(groupArray((rank, term)))) AS themes \
                    FROM document_themes_visible(user_id = ?) WHERE rank <= ? GROUP BY file_id) AS t \
                    ON t.file_id = d.file_id \
-                 ORDER BY d.read_at DESC LIMIT ?",
+                 WHERE ? = '' OR d.file_id = ? ORDER BY d.uploaded_at DESC LIMIT ?",
             )
             .bind(self.user)
             .bind(self.user)
-            .bind(self.user)
             .bind(top_themes)
+            .bind(file_id.unwrap_or(""))
+            .bind(file_id.unwrap_or(""))
             .bind(limit)
             .fetch_all()
+            .await?)
+    }
+
+    /// The authors, kind and year of each of the user's documents: what a
+    /// scope can be made of.
+    pub async fn facet_rows(&self) -> Result<Vec<DocumentFacet>> {
+        Ok(self
+            .client
+            .query("SELECT authors, kind, year FROM documents_visible(user_id = ?)")
+            .bind(self.user)
+            .fetch_all()
+            .await?)
+    }
+
+    /// The user's groups of sources with their files, by name.
+    pub async fn collections(&self) -> Result<Vec<CollectionRow>> {
+        Ok(self
+            .client
+            .query("SELECT collection_id, name, file_ids FROM collections_visible(user_id = ?) ORDER BY name")
+            .bind(self.user)
+            .fetch_all()
+            .await?)
+    }
+
+    /// One of the user's groups: None for a group of someone else, or deleted.
+    pub async fn collection(&self, collection_id: &str) -> Result<Option<CollectionRow>> {
+        Ok(self
+            .client
+            .query("SELECT collection_id, name, file_ids FROM collections_visible(user_id = ?) WHERE collection_id = ?")
+            .bind(self.user)
+            .bind(collection_id)
+            .fetch_optional()
             .await?)
     }
 
@@ -156,7 +185,7 @@ mod tests {
     /// Tables and current views of user data: readers here go through
     /// *_visible instead. The owner links (file_owners, chat_owners) and the
     /// run registry (runs) are not user data and may be read.
-    const USER_DATA: [&str; 16] = [
+    const USER_DATA: [&str; 19] = [
         "files",
         "doc_chunks",
         "doc_chunks_current",
@@ -173,6 +202,9 @@ mod tests {
         "chat_messages_committed",
         "hub_document",
         "link_document_file",
+        "document_edits",
+        "collections",
+        "collection_files",
     ];
 
     /// The names this code reads from: the word after every FROM and JOIN of its SQL.

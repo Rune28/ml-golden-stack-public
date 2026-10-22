@@ -17,6 +17,28 @@ Documents, authors and concepts as Data Vault hubs with links, so a question abo
 - [ ] A paragraph is sometimes the instructions retold ("Нужно написать один абзац…", "This is an example paragraph…") and passes `cites`, because it cites a passage of its theme too
 - [ ] A paragraph cites passages outside its theme or numbers that are no passage (`[3]`, `[2.1]`): `cites` only asks for one citation of the theme, the others are kept
 
+## Next: search scope
+
+A chat scoped to a group of sources, an author, a kind or years, on metadata the model reads and a person confirms or corrects. Plan, decisions and slices: [docs/search-scope-plan.md](docs/search-scope-plan.md).
+
+- [x] M0 Terms do not name documents: `document_words` of a profile, a term made of them only is dropped in route (in the prompt the model ignored it: 26 of 75 messages; in code, 0)
+- [x] M1 Metadata: `read_document` asks the role of every person and picks the authors in code (a person in the file name none of the page's authors shares a surname with wins; what the model writes for no author is no author); `document_edits`, `documents_visible`; correct and confirm on the chat page; author and kind for a batch at upload
+- [x] M2 Groups of sources: personal `collections`, `collection_files`, `collections_visible`, on the chat page
+- [x] M3 Scope of a chat: `Scope`, `resolve_scope`, `file_ids` in every step that searches, `GET /api/facets`, pickers on a new chat, the scope on the answer
+- [x] M4 Where a message looks: groups, authors and kinds it names, matched on its words (`where_in`, `kind_words` of a profile); asked of the model with the lists, 3 right of 45
+- [ ] A group name with a preposition the message leaves out ("Лекции о Прусте" vs "в лекциях Пруста") is not matched: every word of the name must be in the message
+- [ ] The kind of a blog is read as book 1–2 times of 5 (`read_document`): the user corrects it on the card
+- [x] Answers in sections (chat 01a16252: a comparison of Саша's notes with the book of Мамардашвили came back as one mix, 40 chunks of 43 from the book, the book's words given to Саша): route reads `aspects` the message lists and sets `compare` in code when it names two or more authors, groups or kinds (`sides_of`); author names are no terms; each aspect in each side's files gathered apart with a share of the chunks, keyword chunks first and the closest by vector for the rest (`gather` `fill`); a paragraph per aspect over notes marked with whose documents they are from; an aspect with no notes is said. Route with aspects: control questions 10 of 10, the message of that chat 9 of 10 (2026-10-22)
+- [ ] A comparison paragraph invents agreement the notes do not hold ("Оба утверждают, что смерть открыта как страж…"): the prompt asks for where they agree, and a small model finds some
+- [ ] The model guesses an author's gender from nothing ("она описывает" of Мамардашвили): the paragraph step knows only the names
+- [ ] English words inside a Russian paragraph ("surge of hormones"), next to the whole paragraphs in English above
+- [ ] The query garbles a name it shortens ("чем заметки Са: отличаются…", 6 of 6 for that message): harmless while the sides come from `where_in`, wrong wherever the query is shown or searched by
+- [ ] A vague aspect is kept when it is words of the message ("философские вопросы" from "и других философских вопросах"): gathered by vector, it takes a share of the chunks from the aspects asked
+- [ ] "что Саша думает о смерти?" (one subject, no aspects) may still go to interpret: the profile's interpret text ("the user tells their own … thought") pulls a third person's thoughts too; not measured
+- [ ] A dream that names two things of it can give aspects and go to topic: "мне снилось, что я в большом доме и не могу найти выход…" 1 of 5 (`make route-check`, 2026-10-22), through the rule that aspects make a topic; without the rule "что Саша думает о жизни, смерти и любви?" went to interpret 3 of 5
+- [ ] Any message naming two sides is compared, a fact too ("кто старше, Саша или Мамардашвили?"): the rule is in code and ignores the model's kind
+- [x] The control questions of a profile and the script that measures the route on them live nowhere in the repo: now `profiles/control/<profile>.toml` and `make route-check P=<profile>` (the activity route itself, its rules in code included, the user's documents from the file)
+
 ## Next: login and per-user data
 
 A login window and files, documents, chats and answers of every user their own, built to grow into ZTNA. Plan, decisions and slices: [docs/auth-plan.md](docs/auth-plan.md).

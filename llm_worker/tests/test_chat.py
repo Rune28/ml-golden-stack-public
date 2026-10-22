@@ -12,15 +12,20 @@ from workflow.contracts import (
     Broad,
     ChatInput,
     ChatMessage,
-    Gathered,
     GatherInput,
-    Generated,
+    Gathered,
     GenerateInput,
+    Generated,
     MessageInput,
     RecordInput,
     RetrieveInput,
     Route,
     RouteInput,
+    Scope,
+    ScopeInput,
+    Scoped,
+    Section,
+    Side,
     Source,
     SummarizeInput,
 )
@@ -41,6 +46,7 @@ class FakeSteps:
         self.route_to = Route(kind="fact")
         self.gathered = Gathered(mode="chunks", terms=["смерть"], found=2, sources=TOPIC)
         self.summary = "summary of {n} chunks"
+        self.scoped = Scoped(file_ids=["file-1"], label="1 file · group Блоги")
 
     @activity.defn(name="route")
     async def route(self, input: RouteInput) -> Route:
@@ -56,6 +62,11 @@ class FakeSteps:
     async def summarize(self, input: SummarizeInput) -> Generated:
         self.calls.append(("summarize", input))
         return Generated(text=self.summary.format(n=len(input.sources)), model="qwen3:4b")
+
+    @activity.defn(name="resolve_scope")
+    async def resolve_scope(self, input: ScopeInput) -> Scoped:
+        self.calls.append(("resolve_scope", input))
+        return self.scoped
 
     @activity.defn(name="retrieve")
     async def retrieve(self, input: RetrieveInput) -> list[Source]:
@@ -91,8 +102,9 @@ async def chat(env):
             ChatWorkflow.run, ChatInput(chat_id=chat_id, max_turns=max_turns), id=f"chat-{chat_id}", task_queue=queue
         )
 
-        async def send(text, run_id=None, user_id="ann", profile=""):
-            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()), user_id=user_id, profile=profile)
+        async def send(text, run_id=None, user_id="ann", profile="", scope=None):
+            message = MessageInput(text=text, run_id=run_id or str(uuid.uuid4()), user_id=user_id, profile=profile,
+                                   scope=scope or Scope())
             # The workflow ID without a run: after continue-as-new it reaches the new run.
             latest = env.client.get_workflow_handle(handle.id)
             return await latest.execute_update(ChatWorkflow.send_message, message)
@@ -101,7 +113,7 @@ async def chat(env):
 
     async with Worker(env.client, task_queue=queue, workflows=[ChatWorkflow],
                       activities=[steps.retrieve, steps.generate, steps.record,
-                                  steps.route, steps.gather, steps.summarize]):
+                                  steps.route, steps.gather, steps.summarize, steps.resolve_scope]):
         yield steps, start
 
 
@@ -315,3 +327,97 @@ async def test_continue_as_new_carries_the_profile(chat, env):
     description = await env.client.get_workflow_handle(handle.id).describe()
     assert description.run_id != handle.result_run_id
     assert [i.profile for i in steps.of("route")] == ["fitness", "fitness"]
+
+
+BLOGS = Scope(collections=["c-blogs"])
+
+
+async def test_a_chat_without_a_scope_reads_every_visible_file_and_resolves_nothing(chat):
+    steps, start = chat
+    _, send = await start()
+
+    answer = await send("what is S3?")
+
+    assert "resolve_scope" not in [name for name, _ in steps.calls]
+    assert steps.of("retrieve")[0].file_ids == [] and answer.scope_label == ""
+
+
+async def test_the_first_scope_sticks_and_every_step_that_reads_gets_its_files(chat):
+    steps, start = chat
+    _, send = await start()
+
+    await send("проследи путь автора", scope=BLOGS)
+    steps.route_to = Route(kind="topic", terms=["путь"])
+    answer = await send("а что о времени?", scope=Scope(kinds=["book"]))  # one chat, one scope
+
+    assert [i.scope for i in steps.of("resolve_scope")] == [BLOGS, BLOGS]
+    assert steps.of("retrieve")[0].file_ids == ["file-1"] and steps.of("gather")[0].file_ids == ["file-1"]
+    assert answer.scope_label == "1 file · group Блоги"
+
+
+async def test_a_scope_of_no_file_is_said_and_nothing_is_searched(chat):
+    # Never answered from every file instead.
+    steps, start = chat
+    steps.scoped = Scoped(file_ids=[], label="0 files · group Пустая")
+    _, send = await start()
+
+    answer = await send("что там о смерти?", scope=Scope(collections=["c-empty"]))
+
+    assert [name for name, _ in steps.calls] == ["route", "resolve_scope", "record"]
+    assert answer.text.startswith("В выбранной области нет ни одного документа (0 files · group Пустая)")
+    assert answer.sources == []
+
+
+async def test_the_message_s_own_words_narrow_the_chat_s_scope(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="fact", filters=Scope(authors=["Merab Mamardashvili"]))
+    _, send = await start()
+
+    await send("что Мамардашвили говорит о времени?", scope=BLOGS)
+
+    [resolved] = steps.of("resolve_scope")
+    assert (resolved.scope, resolved.narrow) == (BLOGS, Scope(authors=["Merab Mamardashvili"]))
+
+
+async def test_continue_as_new_carries_the_scope(chat, env):
+    steps, start = chat
+    handle, send = await start(max_turns=1)
+
+    await send("first", scope=BLOGS)
+    await send("second")
+
+    description = await env.client.get_workflow_handle(handle.id).describe()
+    assert description.run_id != handle.result_run_id
+    assert [i.scope for i in steps.of("resolve_scope")] == [BLOGS, BLOGS]
+
+
+async def test_a_comparison_gathers_every_aspect_in_every_side_apart_and_summarizes_them_in_sections(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="compare", query="чем отличаются", terms=["философия"], aspects=["смерть", "любовь"],
+                           sides=[Side("Саша", Scope(authors=["Саша"])), Side("Мамардашвили", Scope(authors=["Мамардашвили"]))])
+    _, send = await start()
+
+    answer = await send("что Саша думает о смерти и любви, и чем он отличается от Мамардашвили?")
+
+    # The documents of each side, then a share of the chunks for each aspect in them.
+    assert [s.narrow.authors for s in steps.of("resolve_scope")] == [["Саша"], ["Мамардашвили"]]
+    gathers = steps.of("gather")
+    assert [(g.question, g.terms, g.file_ids, g.fill) for g in gathers] == [
+        ("смерть", ["смерть"], ["file-1"], True), ("любовь", ["любовь"], ["file-1"], True)] * 2
+    assert all(g.max_chunks == 15 for g in gathers)  # 60 for 2 sides of 2 aspects
+    [summarize] = steps.of("summarize")
+    # A chunk gathered twice is one passage, numbered once.
+    assert summarize.sources == TOPIC and answer.sources == TOPIC
+    assert summarize.sections == [Section("смерть", "Саша", [1, 2]), Section("любовь", "Саша", [1, 2]),
+                                  Section("смерть", "Мамардашвили", [1, 2]), Section("любовь", "Мамардашвили", [1, 2])]
+
+
+async def test_a_comparison_whose_sides_have_no_files_is_answered_as_a_fact(chat):
+    steps, start = chat
+    steps.route_to = Route(kind="compare", sides=[Side("A", Scope(authors=["A"])), Side("B", Scope(authors=["B"]))])
+    steps.scoped = Scoped(file_ids=[], label="0 files")
+    _, send = await start()
+
+    await send("чем A отличается от B?")
+
+    assert [name for name, _ in steps.calls] == ["route", "resolve_scope", "resolve_scope", "retrieve", "generate", "record"]

@@ -40,7 +40,8 @@ class Chatter:
         exist: an index committed after its file was deleted stays unseen.
         One text once: the same paragraph in two files takes one place.
         Only the user's files, through the views of what they may see; with
-        no user, nothing (fail closed)."""
+        no user, nothing (fail closed). With file_ids (the chat's scope),
+        only those of them."""
         if not input.user_id:
             return []
         [vector] = self.llm.embed([input.question])
@@ -48,8 +49,9 @@ class Chatter:
             "SELECT c.file_id, c.run_id, c.chunk_id, f.name, cosineDistance(c.embedding, {q:Array(Float32)}) AS distance "
             "FROM doc_chunks_visible(user_id = {u:String}) AS c "
             "INNER JOIN (SELECT file_id, name FROM files_visible(user_id = {u:String})) AS f ON f.file_id = c.file_id "
-            "WHERE c.embed_model = {m:String} ORDER BY distance LIMIT 1 BY cityHash64(c.text) LIMIT {k:UInt32}",
-            parameters={"q": vector, "m": self.llm.embed_model, "k": input.k, "u": input.user_id},
+            "WHERE c.embed_model = {m:String} AND (empty({f:Array(String)}) OR has({f:Array(String)}, c.file_id)) "
+            "ORDER BY distance LIMIT 1 BY cityHash64(c.text) LIMIT {k:UInt32}",
+            parameters={"q": vector, "m": self.llm.embed_model, "k": input.k, "u": input.user_id, "f": input.file_ids},
         ).result_rows
         return [Source(file_id=f, index_run_id=r, chunk_id=c, name=n, distance=float(d)) for f, r, c, n, d in rows]
 

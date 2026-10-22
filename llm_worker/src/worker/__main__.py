@@ -14,6 +14,7 @@ from workflow.activities.chat import Chatter
 from workflow.activities.document import Reader
 from workflow.activities.index import Indexer
 from workflow.activities.mentions import Extractor
+from workflow.activities.scope import ScopeSteps
 from workflow.activities.topic import TopicSteps
 
 # The activities are blocking and wait on the LLM server. index_file holds a
@@ -53,12 +54,13 @@ async def main() -> None:
     extractor = Extractor.from_env()
     topics = TopicSteps.from_env()
     chatter = Chatter.from_env()
+    scoper = ScopeSteps.from_env()
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[IndexWorkflow, ChatWorkflow],
         activities=[indexer.index_file, reader.read_document, extractor.extract_mentions, chatter.retrieve, chatter.generate, chatter.record,
-                    topics.route, topics.gather, topics.summarize],
+                    topics.route, topics.gather, topics.summarize, scoper.resolve_scope],
         activity_executor=ThreadPoolExecutor(MAX_CONCURRENT),
         max_concurrent_activities=MAX_CONCURRENT,
     )

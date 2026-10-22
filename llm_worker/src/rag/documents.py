@@ -14,11 +14,22 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+from rag.mentions import names_a_person
+
 # About the first two pages: the title, the authors, the abstract and the
 # keywords are there, and they fit the context of a small model.
 HEAD = 6000
 
 KINDS = ("article", "book", "notes", "other")
+# The role of a person named on the first pages. Asked to leave out whom the
+# document quotes or is about, qwen3:4b still gave a book of lectures on
+# Proust the author "М. Пруст" 5 times of 5: the title page names Proust's
+# novel, the lecturer only the file name. Asked the role of every person, it
+# called Proust the subject; who the author is follows in code (authors_of).
+ROLES = ("author", "subject", "quoted", "editor", "translator", "illustrator", "publisher", "other")
+# What the model writes for an author no page names.
+_NO_AUTHOR = {"автор", "аноним", "неизвестный автор", "неизвестен", "author", "anonymous", "unknown"}
+_INITIAL = re.compile(r"\b[A-ZА-ЯЁ]\.")
 
 _DOI = re.compile(r"\b10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
 _ISBN = re.compile(r"\bISBN(?:-1[03])?:?\s*((?:[0-9][-\s]?){9}[0-9Xx](?:[-\s]?[0-9]){0,3})")
@@ -28,30 +39,35 @@ METADATA_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string"},
-        "authors": {
+        "people": {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}, "orcid": {"type": "string"}},
-                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string", "enum": list(ROLES)},
+                    "orcid": {"type": "string"},
+                },
+                "required": ["name", "role"],
             },
         },
+        "file_name_author": {"type": "string"},
         "year": {"type": ["integer", "null"]},
         "kind": {"type": "string", "enum": list(KINDS)},
         "abstract": {"type": "string"},
         "keywords": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["title", "authors", "year", "kind", "abstract", "keywords"],
+    "required": ["title", "people", "file_name_author", "year", "kind", "abstract", "keywords"],
 }
 
 METADATA_PROMPT = """You read the first pages of a document and return its metadata as JSON.
 Use only what is written there; never make anything up. The file name and the length of the whole
-text come first, as hints: the file name may carry the author or the title when the pages do not,
-and a text of hundreds of thousands of characters is a book, not an article.
+text come first, as hints: a text of hundreds of thousands of characters is a book, not an article.
 - title: the title as written.
-- authors: the authors in the order listed, each with an ORCID only if one is printed next to the name.
-  A person the document is about or quotes is not its author, and neither are editors, translators,
-  illustrators or publishers. When the pages name no author, take the author from the file name.
+- people: every person named on these pages, in the order listed, each with their role in this document:
+  author (wrote it), subject (the person or the work it is about), quoted (an epigraph or a quotation),
+  editor, translator, illustrator, publisher, or other; an ORCID only if one is printed next to the name.
+- file_name_author: a person's name in the file name, as written there with spaces, or an empty string.
 - year: the year of publication, null if it is not stated.
 - kind: article for a scientific paper, book for a book, notes for personal or informal text, other otherwise.
 - abstract: only a passage the document itself labels as its abstract or summary (Abstract, Summary,
@@ -126,21 +142,61 @@ def author_id(name: str, orcid: str = "") -> str:
     return "name:" + " ".join([re.sub(r"[^\w-]", "", surname.strip()), *initials]).strip()
 
 
-def parse_metadata(data: dict) -> Metadata:
+def looks_like_a_person(name: str, file_name: str = "") -> bool:
+    """Whether a name the model gave can be a person: initials (Ю. П.
+    Сенокосов), a capitalized Latin word (Merab Mamardashvili), or a word
+    pymorphy reads as a name or a surname; not what the model writes for no
+    author ("автор", "Аноним"), not a pronoun ("Меня"), not the file name."""
+    name = name.strip()
+    stem = file_name.rsplit(".", 1)[0].strip().lower()
+    if not name or name.lower() in _NO_AUTHOR or name.lower() in (file_name.strip().lower(), stem):
+        return False
+    if _INITIAL.search(name):
+        return True
+    words = [w for w in re.split(r"[\s_\-]+", name) if w]
+    return any(w[0].isupper() and (w.isascii() or names_a_person(w)) for w in words if w[0].isalpha())
+
+
+def authors_of(data: dict, file_name: str) -> list[tuple[str, str]]:
+    """(name, orcid) of the authors: the people with the role author, unless
+    the file is named after a person none of them shares a surname with;
+    then that person. With roles, the model still called Proust the author
+    of the lectures on him 4 times of 5: his name heads the title page, the
+    lecturer's is only in the file name. "Smith2021_squat.pdf" by Smith and
+    Ivanova keeps both. Underscores of a file name are spaces."""
+    out = []
+    for item in data.get("people") or []:
+        if not isinstance(item, dict) or item.get("role") != "author" or not isinstance(item.get("name"), str):
+            continue
+        name = item["name"].replace("_", " ").strip()
+        if looks_like_a_person(name, file_name):
+            out.append((name, item.get("orcid") if isinstance(item.get("orcid"), str) else ""))
+    named = data.get("file_name_author")
+    named = named.replace("_", " ").strip() if isinstance(named, str) else ""
+    in_name = " ".join(file_name.replace("_", " ").split()).lower()
+    if not (named and " ".join(named.split()).lower() in in_name and looks_like_a_person(named, file_name)):
+        return out
+    if any(_surname(name) == _surname(named) for name, _ in out):
+        return out
+    return [(named, "")]
+
+
+def _surname(name: str) -> str:
+    return author_id(name).removeprefix("name:").split(" ")[0]
+
+
+def parse_metadata(data: dict, file_name: str = "") -> Metadata:
     """The model's answer, checked: wrong types become empty values, an unknown
     kind becomes other, a year out of range is dropped, repeated keywords and
-    authors are kept once."""
+    authors are kept once, and an author is a person (authors_of)."""
     year = data.get("year")
     year = year if isinstance(year, int) and 1000 <= year <= 2100 else None
     kind = data.get("kind") if data.get("kind") in KINDS else "other"
     keywords = list(dict.fromkeys(k.strip() for k in _strings(data.get("keywords")) if k.strip()))
 
     authors: dict[str, Author] = {}
-    for item in data.get("authors") or []:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
-            continue
-        orcid = item.get("orcid") if isinstance(item.get("orcid"), str) else ""
-        author = Author(author_id(item["name"], orcid), item["name"].strip())
+    for name, orcid in authors_of(data, file_name):
+        author = Author(author_id(name, orcid), name)
         authors.setdefault(author.author_id, author)
 
     return Metadata(

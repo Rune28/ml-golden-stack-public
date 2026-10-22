@@ -9,6 +9,7 @@ import pathlib
 import re
 
 import workflow.activities.chat as chat
+import workflow.activities.scope as scope
 import workflow.activities.topic as topic
 
 USER_DATA = {
@@ -16,6 +17,7 @@ USER_DATA = {
     "link_document_author", "link_document_author_current", "chunk_mentions", "chunk_mentions_current",
     "document_themes", "document_themes_current", "term_vectors", "term_vectors_current",
     "chat_messages_committed", "hub_document", "hub_author", "link_document_file",
+    "document_edits", "collections", "collection_files",
 }
 
 
@@ -25,7 +27,7 @@ def read_names(code: str) -> list[str]:
 
 
 def test_the_steps_of_an_answer_read_only_visible_views():
-    for module in (chat, topic):
+    for module in (chat, topic, scope):
         names = read_names(pathlib.Path(module.__file__).read_text())
         assert names, module.__name__
         assert not USER_DATA & set(names), f"{module.__name__} reads {USER_DATA & set(names)} directly"

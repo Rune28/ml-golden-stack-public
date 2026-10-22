@@ -29,6 +29,16 @@
   button.plain { background: transparent; color: var(--accent); border: 1px solid var(--line); }
   button:disabled { opacity: .45; cursor: default; }
   input[type=file] { max-width: 100%; color: var(--muted); }
+  input.field { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; font: inherit; min-width: 0; }
+  .tag { font-size: 12px; color: var(--muted); }
+  .tag.mine { color: var(--accent); }
+  .todo { color: var(--warn); font-size: 12px; white-space: nowrap; }
+  .chip { display: inline-flex; gap: 4px; align-items: center; border: 1px solid var(--line); border-radius: 14px; padding: 2px 4px 2px 10px; font-size: 13px; }
+  .chip button { padding: 0 6px; font-size: 12px; font-weight: 500; }
+  .editor { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; align-items: center; padding: 8px 0; }
+  .editor .wide { grid-column: 1 / -1; }
+  tr.doc { cursor: pointer; }
+  tr.doc:hover td { background: var(--bg); }
   select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; font: inherit; }
   textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px; font: inherit; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 12px; }
@@ -97,8 +107,32 @@
       <input type="file" id="file" accept=".txt,.md,.markdown,.pdf" multiple>
       <button id="upload">Upload</button>
     </div>
+    <!-- Said of the whole batch: kept as the user's correction of each file's document. -->
+    <div class="row" style="margin-top: 8px">
+      <input class="field" id="upload-author" placeholder="Author of these files (optional)" style="flex: 1">
+      <select id="upload-kind" title="Kind of these files (optional)">
+        <option value="">kind: as read</option>
+        <option value="article">article</option><option value="book">book</option>
+        <option value="notes">notes</option><option value="other">other</option>
+      </select>
+    </div>
     <div class="status" id="upload-status"></div>
     <table><tbody id="files"><tr><td class="empty">Loading…</td></tr></tbody></table>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content: space-between">
+      <h2 style="margin: 0">Documents</h2>
+      <span class="todo" id="to-check"></span>
+    </div>
+    <p class="sub" style="font-size: 13px">What each file is, read from its text. Click one to correct or confirm it; your correction wins.</p>
+    <div class="row" id="groups" style="margin: 8px 0"></div>
+    <div class="row">
+      <input class="field" id="new-group" placeholder="New group, e.g. Blogs" style="flex: 1">
+      <button class="plain" id="add-group">Add group</button>
+    </div>
+    <div class="status" id="library-status"></div>
+    <table><tbody id="documents"><tr><td class="empty">Loading…</td></tr></tbody></table>
   </section>
 
   <section class="card">
@@ -118,6 +152,15 @@
         </label>
         <button class="plain" id="new-chat">New chat</button>
       </div>
+    </div>
+    <!-- A new chat only: where it looks, fixed by its first message. -->
+    <div class="row" id="scope-picker" hidden style="margin-top: 8px">
+      <span class="status" style="margin: 0">Look in</span>
+      <select id="scope-group" title="A group of sources"><option value="">any group</option></select>
+      <select id="scope-author" title="An author"><option value="">any author</option></select>
+      <select id="scope-kind" title="A kind of document"><option value="">any kind</option></select>
+      <input class="field" id="scope-from" placeholder="from year" style="width: 6.5em">
+      <input class="field" id="scope-to" placeholder="to year" style="width: 6.5em">
     </div>
     <div class="status" id="chat-id"></div>
     <div id="messages"><div class="empty">Ask a question about the uploaded files.</div></div>
@@ -188,8 +231,9 @@ async function refreshFiles() {
       row.append(status, act);
       body.append(row);
     }
-    // Poll while something is still being indexed.
+    // Poll while something is still being indexed; its document is read then too.
     if (files.some((f) => f.status === "indexing")) refreshTimer = setTimeout(refreshFiles, 3000);
+    refreshLibrary();
   } catch (e) {
     body.replaceChildren(wrap("tr", el("td", "error", `Files: ${e.message}`)));
   }
@@ -219,7 +263,10 @@ $("upload").onclick = async () => {
   for (const file of files) {
     status.textContent = `Uploading ${file.name}…`;
     try {
-      const up = await api("POST", `/api/files?name=${encodeURIComponent(file.name)}`, file, "application/octet-stream");
+      const query = new URLSearchParams({ name: file.name });
+      if ($("upload-author").value.trim()) query.set("author", $("upload-author").value.trim());
+      if ($("upload-kind").value) query.set("kind", $("upload-kind").value);
+      const up = await api("POST", `/api/files?${query}`, file, "application/octet-stream");
       notes.push(up.duplicate ? `${file.name}: already uploaded` : `${file.name}: uploaded, indexing`);
     } catch (e) {
       notes.push(`${file.name}: ${e.message}`);
@@ -254,6 +301,9 @@ async function send() {
     const body = { text };
     if (!chatId) {
       if (profiles.length) body.profile = $("profile").value;
+      const scope = chosenScope();
+      if (scope) body.scope = scope;
+      $("scope-picker").hidden = true;
       chatId = (await api("POST", "/api/chats")).chat_id;
       $("chat-id").textContent = `chat ${chatId}`;
       $("profile-picker").hidden = true;
@@ -264,7 +314,7 @@ async function send() {
     $("question").value = "";
     const answer = await api("POST", `/api/chats/${chatId}/messages`, JSON.stringify(body), "application/json");
     addMessage("assistant", answer.text, answer.sources);
-    status.textContent = [`turn ${answer.turn}`, answer.model, answer.profile].filter(Boolean).join(" · ");
+    status.textContent = [`turn ${answer.turn}`, answer.model, answer.profile, answer.scope_label].filter(Boolean).join(" · ");
     refreshChats();
   } catch (e) {
     status.className = "status error";
@@ -291,6 +341,7 @@ async function openChat() {
   status.textContent = "";
   $("chat-id").textContent = chatId ? `chat ${chatId}` : "";
   $("profile-picker").hidden = Boolean(chatId) || !profiles.length;
+  $("scope-picker").hidden = Boolean(chatId);
   $("messages").replaceChildren(el("div", "empty", "Ask a question about the uploaded files."));
   markCurrentChat();
   if (!chatId) return;
@@ -402,6 +453,181 @@ function showLogin() {
   $("login-status").textContent = "";
   $("email").focus();
   checkLogin();
+}
+
+// The user's documents and groups (the library): what each file is, the
+// user's correction over what the platform read from its text.
+const KINDS = ["article", "book", "notes", "other"];
+let documents = [], collections = [], openDocument = null;
+
+async function refreshLibrary() {
+  try {
+    [documents, collections] = await Promise.all([api("GET", "/api/documents"), api("GET", "/api/collections")]);
+  } catch (e) {
+    $("library-status").className = "status error";
+    $("library-status").textContent = `Documents: ${e.message}`;
+    return;
+  }
+  renderGroups();
+  renderDocuments();
+  refreshFacets();
+}
+
+function groupName(id) {
+  return (collections.find((c) => c.collection_id === id) || {}).name;
+}
+
+function renderGroups() {
+  const box = $("groups");
+  box.replaceChildren();
+  if (!collections.length) box.append(el("span", "tag", "No groups yet: a group is a set of sources a chat can be limited to."));
+  for (const c of collections) {
+    const chip = el("span", "chip", `${c.name} · ${c.file_ids.length}`);
+    const rename = el("button", "plain", "✎");
+    rename.title = "Rename";
+    rename.onclick = () => changeGroup(c, prompt("New name", c.name));
+    const remove = el("button", "plain", "×");
+    remove.title = "Delete the group (its files stay)";
+    remove.onclick = () => confirm(`Delete the group ${c.name}? Its files stay.`) && changeGroup(c, null, true);
+    chip.append(rename, remove);
+    box.append(chip);
+  }
+}
+
+async function libraryCall(promise) {
+  const status = $("library-status");
+  status.className = "status";
+  status.textContent = "";
+  try {
+    await promise;
+  } catch (e) {
+    status.className = "status error";
+    status.textContent = e.message;
+  }
+  await refreshLibrary();
+}
+
+$("add-group").onclick = () => {
+  const name = $("new-group").value.trim();
+  if (!name) return;
+  $("new-group").value = "";
+  libraryCall(api("POST", "/api/collections", JSON.stringify({ name }), "application/json"));
+};
+
+function changeGroup(c, name, deleted = false) {
+  if (!deleted && (name === null || !name.trim())) return;
+  const body = deleted ? { deleted: true } : { name: name.trim() };
+  libraryCall(api("PUT", `/api/collections/${c.collection_id}`, JSON.stringify(body), "application/json"));
+}
+
+function renderDocuments() {
+  const body = $("documents");
+  body.replaceChildren();
+  const toCheck = documents.filter((d) => d.read && !d.confirmed).length;
+  $("to-check").textContent = toCheck ? `${toCheck} to check` : "";
+  if (!documents.length) body.append(wrap("tr", el("td", "empty", "No documents yet.")));
+  for (const d of documents) {
+    const row = el("tr", "doc");
+    const what = el("td");
+    what.append(el("div", "", d.title || d.name), el("div", "tag", [d.authors.join(", ") || "no author",
+      [d.kind, d.year].filter(Boolean).join(" · ")].filter(Boolean).join(" — ")));
+    const groups = d.collection_ids.map(groupName).filter(Boolean);
+    if (groups.length) what.append(el("div", "tag mine", groups.join(", ")));
+    const state = !d.read ? el("td", "num", "reading…") : d.confirmed ? el("td", "num indexed", "checked") : el("td", "todo", "to check");
+    row.append(what, state);
+    row.onclick = () => { openDocument = openDocument === d.file_id ? null : d.file_id; renderDocuments(); };
+    body.append(row);
+    if (openDocument === d.file_id) body.append(editorRow(d));
+  }
+}
+
+// The card of a document: every field with where it comes from, the groups of the file.
+function editorRow(d) {
+  const box = el("div", "editor");
+  const source = (s) => el("span", s === "edit" ? "tag mine" : "tag", s === "edit" ? "yours" : "from text");
+  const field = (label, input, s) => {
+    const cell = el("div", "row");
+    cell.append(input, source(s));
+    box.append(el("span", "tag", label), cell);
+  };
+  const title = Object.assign(el("input", "field"), { value: d.title, style: "flex: 1" });
+  const authors = Object.assign(el("input", "field"), { value: d.authors.join(", "), style: "flex: 1",
+    placeholder: "Authors, comma-separated" });
+  const kind = el("select");
+  for (const k of KINDS) kind.append(Object.assign(el("option", "", k), { value: k, selected: k === d.kind }));
+  const year = Object.assign(el("input", "field"), { value: d.year ?? "", placeholder: "year", style: "width: 6em" });
+  field("Title", title, d.title_source);
+  field("Authors", authors, d.authors_source);
+  field("Kind", kind, d.kind_source);
+  field("Year", year, d.year_source);
+  box.append(Object.assign(el("span", "tag wide", `File: ${d.name}`)));
+
+  const groups = el("div", "row wide");
+  for (const c of collections) {
+    const check = Object.assign(el("input"), { type: "checkbox", checked: d.collection_ids.includes(c.collection_id) });
+    check.onchange = () => libraryCall(api(check.checked ? "POST" : "DELETE",
+      `/api/collections/${c.collection_id}/files/${d.file_id}`));
+    const label = el("label", "row");
+    label.append(check, el("span", "", c.name));
+    groups.append(label);
+  }
+  if (collections.length) box.append(el("span", "tag wide", "Groups"), groups);
+
+  // Only what changed is a correction; both buttons mark the card checked.
+  const save = (changes) => libraryCall(api("PUT", `/api/files/${d.file_id}/document`,
+    JSON.stringify({ ...changes, confirmed: true }), "application/json"));
+  const changes = () => {
+    const out = {};
+    if (title.value.trim() !== d.title) out.title = title.value;
+    const list = authors.value.split(",").map((a) => a.trim()).filter(Boolean);
+    if (list.join("\n") !== d.authors.join("\n")) out.authors = list;
+    if (kind.value !== d.kind) out.kind = kind.value;
+    const y = year.value.trim() === "" ? null : Number(year.value);
+    if (y !== (d.year ?? null)) out.year = y;
+    return out;
+  };
+  const buttons = el("div", "row wide");
+  const confirmButton = el("button", "plain", "Confirm as is");
+  confirmButton.onclick = () => save({});
+  const saveButton = el("button", "", "Save");
+  saveButton.onclick = () => save(changes());
+  buttons.append(saveButton, confirmButton);
+  box.append(buttons);
+
+  const cell = el("td");
+  cell.colSpan = 2;
+  cell.append(box);
+  return wrap("tr", cell);
+}
+
+// Where a new chat looks: the values the user's own documents have.
+async function refreshFacets() {
+  let facets;
+  try {
+    facets = await api("GET", "/api/facets");
+  } catch {
+    return;  // the chat still works, over every file
+  }
+  const fill = (id, any, items) => {
+    const select = $(id), kept = select.value;
+    select.replaceChildren(Object.assign(el("option", "", any), { value: "" }),
+      ...items.map(([value, text]) => Object.assign(el("option", "", text), { value, selected: value === kept })));
+  };
+  fill("scope-group", "any group", facets.collections.map((c) => [c.collection_id, `${c.name} (${c.files})`]));
+  fill("scope-author", "any author", facets.authors.map((a) => [a.value, `${a.value} (${a.documents})`]));
+  fill("scope-kind", "any kind", facets.kinds.map((k) => [k.value, `${k.value} (${k.documents})`]));
+}
+
+// The scope of a new chat, or null for every file.
+function chosenScope() {
+  const scope = {};
+  if ($("scope-group").value) scope.collections = [$("scope-group").value];
+  if ($("scope-author").value) scope.authors = [$("scope-author").value];
+  if ($("scope-kind").value) scope.kinds = [$("scope-kind").value];
+  const year = (id) => ($(id).value.trim() ? Number($(id).value) : null);
+  if (year("scope-from") !== null) scope.year_from = year("scope-from");
+  if (year("scope-to") !== null) scope.year_to = year("scope-to");
+  return Object.keys(scope).length ? scope : null;
 }
 
 // The choice of a new chat, the platform's default chosen. Without the list

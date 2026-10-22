@@ -15,6 +15,8 @@ and choosing the profile of a chat is the platform's (workflow.profiles).
 
 from dataclasses import dataclass
 
+from rag.documents import KINDS as DOCUMENT_KINDS
+from rag.mentions import candidates, word_lemmas
 from rag.topics import KINDS
 
 
@@ -27,6 +29,14 @@ class Profile:
     # how to pick the terms.
     kinds: dict[str, str]
     terms: str
+    # Lemmas of the words that name the documents themselves (книга, блог,
+    # автор): a term made of them only is dropped, since it says where to
+    # look, not what about. Told so in the prompt, qwen3:4b still gave such
+    # terms in 26 messages of 75 (2026-10-22); dropped in code, none.
+    document_words: frozenset[str]
+    # Words a message names a kind of document by ("книга" → book), as
+    # lemmas: a kind the message names narrows where to look (rag.topics.where_in).
+    kind_words: dict[str, str]
     # gather: candidates for synonyms, and examples of what is one and what is not.
     similar_max_distance: float
     similar_candidates: int
@@ -54,12 +64,19 @@ def profile_from(name: str, version: str, data: dict) -> Profile:
 
     route = section(data, "route", "")
     kinds = {kind: text(section(route, kind, "route."), "text", f"route.{kind}") for kind in KINDS}
+    named = route.get("kind_words", {})
+    if not isinstance(named, dict) or not all(isinstance(w, str) and v in DOCUMENT_KINDS for w, v in named.items()):
+        raise ValueError(f"profile {name}: route.kind_words must map words to kinds of {', '.join(DOCUMENT_KINDS)}")
+    kind_words = {lemma: kind for word, kind in named.items() for lemma in word_lemmas(word)}
+    words = route.get("document_words", [])
+    if not isinstance(words, list) or not all(isinstance(w, str) and w.strip() for w in words):
+        raise ValueError(f"profile {name}: route.document_words must be a list of words")
 
     similar = section(data, "similar", "")
-    distance, candidates = similar.get("max_distance"), similar.get("candidates")
+    distance, how_many = similar.get("max_distance"), similar.get("candidates")
     if not isinstance(distance, (int, float)) or isinstance(distance, bool) or not 0 <= distance <= 1:
         raise ValueError(f"profile {name}: similar.max_distance must be a number from 0 to 1")
-    if not isinstance(candidates, int) or isinstance(candidates, bool) or candidates < 0:
+    if not isinstance(how_many, int) or isinstance(how_many, bool) or how_many < 0:
         raise ValueError(f"profile {name}: similar.candidates must be a whole number, 0 or more")
 
     return Profile(
@@ -67,9 +84,13 @@ def profile_from(name: str, version: str, data: dict) -> Profile:
         version=version,
         kinds=kinds,
         terms=text(route, "terms", "route"),
+        # As stored: "книгах" in a question and "книга" here are one word.
+        kind_words=kind_words,
+        document_words=frozenset(lemma for w in words for lemma in candidates(w.strip()) or [w.strip().lower()]),
         similar_max_distance=float(distance),
-        similar_candidates=candidates,
+        similar_candidates=how_many,
         similar_same=text(similar, "same", "similar"),
         similar_related=text(similar, "related", "similar"),
         attribution=text(section(data, "map", ""), "attribution", "map"),
     )
+

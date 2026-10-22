@@ -80,6 +80,33 @@ def _parse(word: str):
     return _morph().parse(word)[0]
 
 
+_LATIN = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                  ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t",
+                   "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e", "yu", "ya"]))
+
+
+def latin(word: str) -> str:
+    """A word in Latin letters, lowercase: Мамардашвили and Mamardashvili are one."""
+    return "".join(_LATIN.get(c, c) for c in word.lower())
+
+
+def word_lemmas(text: str) -> set[str]:
+    """The lemma of every word of a text, lowercase (ё as е); a word not in
+    Russian as it is: "в своих блогах" → {в, свой, блог}."""
+    out = set()
+    for raw in _WORD.findall(text):
+        word = raw.lower().replace("ё", "е")
+        out.add(_parse(word).normal_form.replace("ё", "е") if _CYRILLIC.search(word) else word)
+    return out
+
+
+def names_a_person(word: str) -> bool:
+    """Whether pymorphy reads a Russian word as a first name, a surname or a
+    patronymic in any of its readings: Пруст, Мамардашвили, Мераб; not
+    автор, меня or блог."""
+    return any({"Name", "Surn", "Patr"} & set(p.tag.grammemes) for p in _morph().parse(word.lower().replace("ё", "е")))
+
+
 def _english(word: str) -> str | None:
     """A crude lemma of an English word, or None for a word left out."""
     if word in _EN_STOP or len(word) < 3:

@@ -22,6 +22,15 @@ terms = """the subject asked about first (время,
   свобода), then a name or a word that narrows it. Never only a name: "как автор понимает свободу?"
   gives свободу, автор."""
 
+# The words that name the documents, not what is asked about them: a term
+# made of them only is dropped in code (rag.profiles, document_words).
+document_words = ["автор", "файл", "блог", "книга", "статья", "текст", "документ"]
+
+# Words a message names a kind of document by: "что в книге сказано о времени"
+# looks in books only (rag.topics.where_in). A group or an author it names
+# narrows it the same way, by the user's own names for them.
+kind_words = { "книга" = "book", "заметка" = "notes", "статья" = "article" }
+
 [similar]
 max_distance = 0.3
 candidates = 15

@@ -17,7 +17,7 @@ Tables written by pipeline runs (`predictions`, `digit_report`, `doc_chunks`, `c
 - The keys of the inputs keep their name downstream as `<parent>_run_id` (`prediction_run_id`), so lineage is a join. Source data from be_service uses `batch_id`.
 - A writer deletes or rewrites rows filtered by its own `run_id`.
 
-Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. Deleting a file (be_service) removes what was made from it in reader order: the markers of its runs (index, document), the document rows, the chunks, the object, the row last.
+Reference data uses its natural key instead: `files` is keyed by `file_id`, the sha256 of the bytes. What a user enters is reference data of that user, keyed by them: `document_edits` (user_id, file_id), `collections` (user_id, collection_id), `collection_files`; a new run never touches it, a save writes the whole row again (ReplacingMergeTree, read with FINAL), and the user's deletion of a file removes their rows of it. Deleting a file (be_service) removes what was made from it in reader order: the markers of its runs (index, document), the document rows, the chunks, the object, the row last.
 
 ## Postgres: the database `chat`
 
