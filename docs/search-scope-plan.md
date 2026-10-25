@@ -16,7 +16,7 @@ The goal: a chat has a scope (a group, an author, a kind, years, given files); i
 
 1. **What a person enters is reference data, not the output of a run** (principle 4): a natural key, untouched by a new index or a new document run. It lives in ClickHouse next to `file_owners`; be_service alone writes it.
 2. **Corrections are each user's own**, keyed `(user_id, file_id)`: one user's correction never changes what another sees, the isolation of A2. What the model extracted stays shared.
-3. **Groups are personal collections.** A library shared with athletes changes the visibility model of A2 and comes with coach_service.
+3. **Groups are personal collections.** A library shared with athletes changes the visibility model of A2.
 4. **One view of a document per user**, `documents_visible(user_id)`: the user's correction over `sat_document_visible` and `link_document_author_visible`, with the source of every field (`edit` or `text`), whether it was confirmed, and the file's collections. The document page, the facets and the scope all read it.
 5. **The scope narrows what a user may see and never widens it.** The steps of an answer add `file_id IN (…)` to their `*_visible` reads; an empty list is everything visible. A scope that matches nothing is answered as such, never from the whole corpus.
 6. **A chat's scope is fixed by its first message**, like its profile, and carried over continue-as-new. Filters read from a question (M4) narrow it for that message only.
@@ -46,4 +46,4 @@ The critical parts: the writes of `document_edits` and `collection_files` (only 
 
 ## Later
 
-Comparing groups ("how the blogs differ from the Topology": a gather per group, then a comparison) · the design of a study and the metadata of papers from Crossref or PubMed, with the corpus on training · a library shared with athletes (coach_service) · finding documents by topic (S7 `find_documents` of [documents-plan.md](documents-plan.md)) · merging authors (entity resolution).
+Comparing groups ("how the blogs differ from the Topology": a gather per group, then a comparison) · the design of a study and the metadata of papers from Crossref or PubMed, with the corpus on training · finding documents by topic (S7 `find_documents` of [documents-plan.md](documents-plan.md)) · merging authors (entity resolution).
